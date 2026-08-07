@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coreflow"
+version = "0.1.0"
+description = "Context-centric resource management prototype for LLM agent workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=2.0,<2.4",
+  "scipy>=1.8",
+  "scikit-learn",
+  "pandas",
+  "matplotlib",
+  "seaborn==0.13.2",
+  "fastapi==0.121.0",
+  "ray==2.53.0",
+  "redis",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["coreflow*"]

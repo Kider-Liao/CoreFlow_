@@ -1,0 +1,408 @@
+{
+  "./manual_001.json": 
+  [
+    {
+      "node_id": "1:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        880
+      ],
+      "output_tokens": [
+        402
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "1:1",
+      "agent_name": "Plan",
+      "input_tokens": [
+        880
+      ],
+      "output_tokens": [
+        402
+      ],
+      "cached_tokens": [
+        1282
+      ]
+    },
+    {
+      "node_id": "1:2",
+      "agent_name": "Plan",
+      "input_tokens": [
+        880
+      ],
+      "output_tokens": [
+        402
+      ],
+      "cached_tokens": [
+        2564
+      ]
+    },
+    {
+      "node_id": "2:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "2:1",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        1343
+      ]
+    },
+    {
+      "node_id": "2:2",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        2686
+      ]
+    },
+    {
+      "node_id": "2:3",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        4029
+      ]
+    },
+    {
+      "node_id": "2:4",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        5372
+      ]
+    },
+    {
+      "node_id": "2:5",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        6715
+      ]
+    },
+    {
+      "node_id": "2:6",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        8058
+      ]
+    },
+    {
+      "node_id": "2:7",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        9401
+      ]
+    },
+    {
+      "node_id": "3:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "3:1",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        1343
+      ]
+    },
+    {
+      "node_id": "3:2",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        2686
+      ]
+    },
+    {
+      "node_id": "3:3",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        4029
+      ]
+    },
+    {
+      "node_id": "3:4",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        5372
+      ]
+    },
+    {
+      "node_id": "3:5",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        6715
+      ]
+    },
+    {
+      "node_id": "3:6",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        8058
+      ]
+    },
+    {
+      "node_id": "3:7",
+      "agent_name": "Search",
+      "input_tokens": [
+        1165
+      ],
+      "output_tokens": [
+        178
+      ],
+      "cached_tokens": [
+        9401
+      ]
+    },
+    {
+      "node_id": "4:0",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "4:1",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        1557
+      ]
+    },
+    {
+      "node_id": "4:2",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        3114
+      ]
+    },
+    {
+      "node_id": "4:3",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        4671
+      ]
+    },
+    {
+      "node_id": "4:4",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        6226
+      ]
+    },
+    {
+      "node_id": "4:5",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        7785
+      ]
+    },
+    {
+      "node_id": "4:6",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        9342
+      ]
+    },
+    {
+      "node_id": "4:7",
+      "agent_name": "Code",
+      "input_tokens": [
+        984
+      ],
+      "output_tokens": [
+        573
+      ],
+      "cached_tokens": [
+        10899
+      ]
+    },
+    {
+      "node_id": "5:0",
+      "agent_name": "Code",
+      "input_tokens": [
+        3104
+      ],
+      "output_tokens": [
+        304
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "5:1",
+      "agent_name": "Code",
+      "input_tokens": [
+        3104
+      ],
+      "output_tokens": [
+        304
+      ],
+      "cached_tokens": [
+        4661
+      ]
+    },
+    {
+      "node_id": "5:2",
+      "agent_name": "Code",
+      "input_tokens": [
+        3104
+      ],
+      "output_tokens": [
+        304
+      ],
+      "cached_tokens": [
+        9322
+      ]
+    },
+    {
+      "node_id": "5:3",
+      "agent_name": "Code",
+      "input_tokens": [
+        3104
+      ],
+      "output_tokens": [
+        304
+      ],
+      "cached_tokens": [
+        13983
+      ]
+    }
+  ]
+}

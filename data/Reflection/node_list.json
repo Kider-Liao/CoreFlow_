@@ -1,0 +1,317 @@
+{
+  "./manual_001.json": 
+  [
+    {
+      "node_id": "1:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        269
+      ],
+      "output_tokens": [
+        146
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "2:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "3:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "4:0",
+      "agent_name": "Reflect",
+      "input_tokens": [
+        3036
+      ],
+      "output_tokens": [
+        227
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "5:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        269
+      ],
+      "output_tokens": [
+        146
+      ],
+      "cached_tokens": [
+        415
+      ]
+    },
+    {
+      "node_id": "6:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "7:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "8:0",
+      "agent_name": "Reflect",
+      "input_tokens": [
+        3036
+      ],
+      "output_tokens": [
+        227
+      ],
+      "cached_tokens": [
+        3263
+      ]
+    },
+    {
+      "node_id": "9:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        269
+      ],
+      "output_tokens": [
+        146
+      ],
+      "cached_tokens": [
+        830
+      ]
+    },
+    {
+      "node_id": "10:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "11:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "12:0",
+      "agent_name": "Reflect",
+      "input_tokens": [
+        3036
+      ],
+      "output_tokens": [
+        227
+      ],
+      "cached_tokens": [
+        6526
+      ]
+    },
+    {
+      "node_id": "13:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        269
+      ],
+      "output_tokens": [
+        146
+      ],
+      "cached_tokens": [
+        1245
+      ]
+    },
+    {
+      "node_id": "14:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "15:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "16:0",
+      "agent_name": "Reflect",
+      "input_tokens": [
+        3036
+      ],
+      "output_tokens": [
+        227
+      ],
+      "cached_tokens": [
+        9789
+      ]
+    },
+    {
+      "node_id": "17:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        269
+      ],
+      "output_tokens": [
+        146
+      ],
+      "cached_tokens": [
+        1660
+      ]
+    },
+    {
+      "node_id": "18:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "19:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "20:0",
+      "agent_name": "Reflect",
+      "input_tokens": [
+        3036
+      ],
+      "output_tokens": [
+        227
+      ],
+      "cached_tokens": [
+        13052
+      ]
+    },
+    {
+      "node_id": "21:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        269
+      ],
+      "output_tokens": [
+        146
+      ],
+      "cached_tokens": [
+        2075
+      ]
+    },
+    {
+      "node_id": "22:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "23:0",
+      "agent_name": "Search",
+      "input_tokens": [
+        110
+      ],
+      "output_tokens": [
+        782
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "24:0",
+      "agent_name": "Reflect",
+      "input_tokens": [
+        3036
+      ],
+      "output_tokens": [
+        227
+      ],
+      "cached_tokens": [
+        16315
+      ]
+    }
+  ]
+}

@@ -1,0 +1,317 @@
+{
+  "./manual_001.json": 
+  [
+    {
+      "node_id": "1:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        167
+      ],
+      "output_tokens": [
+        70
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "2:0",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        0
+      ]
+    },
+    {
+      "node_id": "2:1",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        613
+      ]
+    },
+    {
+      "node_id": "2:2",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        1226
+      ]
+    },
+    {
+      "node_id": "3:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        167
+      ],
+      "output_tokens": [
+        70
+      ],
+      "cached_tokens": [
+        237
+      ]
+    },
+    {
+      "node_id": "4:0",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        1839
+      ]
+    },
+    {
+      "node_id": "4:1",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        2452
+      ]
+    },
+    {
+      "node_id": "4:2",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        3065
+      ]
+    },
+    {
+      "node_id": "5:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        167
+      ],
+      "output_tokens": [
+        70
+      ],
+      "cached_tokens": [
+        474
+      ]
+    },
+    {
+      "node_id": "6:0",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        3678
+      ]
+    },
+    {
+      "node_id": "6:1",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        4291
+      ]
+    },
+    {
+      "node_id": "6:2",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        4904
+      ]
+    },
+    {
+      "node_id": "7:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        167
+      ],
+      "output_tokens": [
+        70
+      ],
+      "cached_tokens": [
+        711
+      ]
+    },
+    {
+      "node_id": "8:0",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        5517
+      ]
+    },
+    {
+      "node_id": "8:1",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        6130
+      ]
+    },
+    {
+      "node_id": "8:2",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        6743
+      ]
+    },
+    {
+      "node_id": "9:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        167
+      ],
+      "output_tokens": [
+        70
+      ],
+      "cached_tokens": [
+        948
+      ]
+    },
+    {
+      "node_id": "10:0",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        7356
+      ]
+    },
+    {
+      "node_id": "10:1",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        7969
+      ]
+    },
+    {
+      "node_id": "10:2",
+      "agent_name": "Task",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        8582
+      ]
+    },
+    {
+      "node_id": "11:0",
+      "agent_name": "Plan",
+      "input_tokens": [
+        167
+      ],
+      "output_tokens": [
+        70
+      ],
+      "cached_tokens": [
+        1185
+      ]
+    },
+    {
+      "node_id": "12:0",
+      "agent_name": "Reflector",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        9195
+      ]
+    },
+    {
+      "node_id": "12:1",
+      "agent_name": "Reflector",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        9808
+      ]
+    },
+    {
+      "node_id": "12:2",
+      "agent_name": "Reflector",
+      "input_tokens": [
+        500
+      ],
+      "output_tokens": [
+        113
+      ],
+      "cached_tokens": [
+        10421
+      ]
+    }
+  ]
+}
