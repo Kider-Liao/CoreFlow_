@@ -38,6 +38,8 @@ from vllm.logits_process import get_bad_words_logits_processors
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.guided_decoding import (
     get_local_guided_decoding_logits_processor)
+from vllm.model_executor.layers.forced_decode import (
+    ForceDecodeLogitsProcessor)
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.processing import EncDecMultiModalProcessor
@@ -2090,12 +2092,11 @@ class LLMEngine:
             if output_tokens:  # non-empty list
                 eos_token_id = sampling_params.extra_args.get(
                     "eos_token_id", -1)
-                if eos_token_id < 0:
+                if eos_token_id is None:
+                    eos_token_id = -1
+                if eos_token_id < 0 and self.tokenizer is not None:
                     tokenizer = self.get_tokenizer(lora_request=lora_request)
                     eos_token_id = getattr(tokenizer, "eos_token_id", -1)
-                # late import — torch may not be available until model loads
-                from vllm.model_executor.layers.forced_decode import (
-                    ForceDecodeLogitsProcessor)
                 processor = ForceDecodeLogitsProcessor(
                     list(output_tokens), eos_token_id=eos_token_id)
                 logits_processors.append(processor)

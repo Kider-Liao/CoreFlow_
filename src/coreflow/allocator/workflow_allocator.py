@@ -1,10 +1,7 @@
-"""Workflow-level allocator: iteratively balances GPUs across multiple agents."""
+"""Workflow-level allocator: greedily assigns instances across agents."""
 
 from dataclasses import dataclass, field
-from math import floor
 from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 
 from coreflow.allocator.agent_allocator import AgentAllocator
 from coreflow.allocator.instance_orchestrator import InstanceAssignment
@@ -37,9 +34,9 @@ class WorkflowAllocation:
 class WorkflowAllocator:
     """Top-level allocator for multi-agent workflow GPU distribution.
 
-    Uses iterative rebalancing: starts with an invocation-proportional GPU
-    distribution, then repeatedly transfers GPUs from high-throughput to
-    low-throughput agents until the min-throughput across agents is maximized.
+    Starts with one instance per agent.  It then repeatedly gives one more
+    instance to the agent with the lowest normalized throughput until the GPU
+    budget is exhausted.
     """
 
     def __init__(
@@ -66,7 +63,7 @@ class WorkflowAllocator:
         initial_gpus_per_agent: Optional[List[int]] = None,
         verbose: bool = False,
     ) -> WorkflowAllocation:
-        """Run the iterative GPU rebalancing algorithm.
+        """Run the greedy per-instance workflow allocation algorithm.
 
         Args:
             agents: Ordered list of agent names.
@@ -79,14 +76,26 @@ class WorkflowAllocator:
             min_instance_group: Min instance groups per agent.
             interference: Account for interference.
             reuse: Enable KV cache reuse.
-            initial_gpus_per_agent: Starting GPU allocation. If omitted, the
-                allocator initializes proportionally to invocation frequency.
+            initial_gpus_per_agent: Legacy argument; ignored by the current
+                greedy strategy.
             verbose: Print per-iteration progress.
 
         Returns:
             WorkflowAllocation with final GPU distribution and throughputs.
         """
         G = dp_gpu_step  # shorthand for readability
+        if not agents:
+            return WorkflowAllocation()
+        if G <= 0:
+            raise ValueError("dp_gpu_step must be positive")
+        if total_num_gpus % G != 0:
+            raise ValueError(
+                "total_num_gpus must be divisible by dp_gpu_step/gpus_per_instance"
+            )
+        if total_num_gpus < len(agents) * G:
+            raise ValueError(
+                "total_num_gpus is too small to allocate one instance per agent"
+            )
 
         # Compute agent invocation counts
         agent_invocations = self._analyzer.avg_num_invocations(agents)
@@ -105,46 +114,43 @@ class WorkflowAllocator:
                 reuse=reuse,
             )
 
-        # Initialize GPU distribution respecting dp_gpu_step granularity
-        if initial_gpus_per_agent is None:
-            gpus = self._initial_proportional_allocation(
+        # Start with one instance per agent, then allocate one instance at a
+        # time to the current workflow bottleneck.
+        gpus = [G] * len(agents)
+        allocated_gpus = len(agents) * G
+        iterations = 0
+
+        while allocated_gpus < total_num_gpus:
+            throughputs = self._normalized_throughputs(
                 agents=agents,
-                total_num_gpus=total_num_gpus,
-                gpu_step=G,
-                min_instance_group=min_instance_group,
+                gpus=gpus,
+                dp_results=dp_results,
                 agent_invocations=agent_invocations,
             )
-        else:
-            gpus = list(initial_gpus_per_agent)
-
-        # Iterative rebalancing (in steps of G)
-        for iteration in range(self._max_iterations):
-            # Compute normalized throughput for current allocation
-            throughputs = [
-                dp_results[agent][gpus[i]].throughput / agent_invocations[agent]
-                for i, agent in enumerate(agents)
-            ]
             if verbose:
-                print(f"Iter {iteration}: gpus={gpus}, throughputs={[f'{t:.2f}' for t in throughputs]}")
+                print(
+                    f"Iter {iterations}: gpus={gpus}, "
+                    f"throughputs={[f'{t:.2f}' for t in throughputs]}"
+                )
 
-            min_tp = min(throughputs)
-            min_idx = int(np.argmin(throughputs))
-
-            # Try to improve by taking G GPUs from a high-throughput agent
-            candidate = self._find_donor(
-                agents, dp_results, gpus, min_tp, agent_invocations, G
+            bottleneck_idx = min(
+                range(len(agents)),
+                key=lambda idx: (throughputs[idx], agents[idx]),
             )
-            if candidate == -1:
-                break  # Converged
-
-            gpus[min_idx] += G
-            gpus[candidate] -= G
+            gpus[bottleneck_idx] += G
+            allocated_gpus += G
+            iterations += 1
 
         # Build final result
-        final_throughputs: Dict[str, float] = {}
-        for i, agent in enumerate(agents):
-            tp = dp_results[agent][gpus[i]].throughput
-            final_throughputs[agent] = tp / agent_invocations[agent]
+        final_throughputs = dict(zip(
+            agents,
+            self._normalized_throughputs(
+                agents=agents,
+                gpus=gpus,
+                dp_results=dp_results,
+                agent_invocations=agent_invocations,
+            ),
+        ))
 
         return WorkflowAllocation(
             gpu_allocation=dict(zip(agents, gpus)),
@@ -152,86 +158,22 @@ class WorkflowAllocator:
             dp_results=dp_results,
             min_throughput=min(final_throughputs.values()),
             agent_invocations=agent_invocations,
-            iterations=iteration + 1,
+            iterations=iterations,
         )
 
     @staticmethod
-    def _initial_proportional_allocation(
+    def _normalized_throughputs(
         agents: List[str],
-        total_num_gpus: int,
-        gpu_step: int,
-        min_instance_group: int,
-        agent_invocations: Dict[str, float],
-    ) -> List[int]:
-        """Initialize per-agent GPUs by invocation proportion, then adjust."""
-        if not agents:
-            return []
-
-        min_units = min_instance_group
-        total_units = total_num_gpus // gpu_step
-        base_units = [min_units] * len(agents)
-        remaining_units = total_units - sum(base_units)
-        if remaining_units <= 0:
-            gpus = [units * gpu_step for units in base_units]
-            if total_num_gpus > sum(gpus):
-                gpus[-1] += total_num_gpus - sum(gpus)
-            return gpus
-
-        weights = [
-            max(float(agent_invocations.get(agent, 0.0)), 1e-9)
-            for agent in agents
-        ]
-        total_weight = sum(weights)
-        raw_extra = [
-            remaining_units * weight / total_weight
-            for weight in weights
-        ]
-        extra_units = [floor(value) for value in raw_extra]
-
-        while sum(extra_units) < remaining_units:
-            idx = max(
-                range(len(agents)),
-                key=lambda i: raw_extra[i] - extra_units[i],
-            )
-            extra_units[idx] += 1
-
-        gpus = [
-            (base_units[i] + extra_units[i]) * gpu_step
-            for i in range(len(agents))
-        ]
-        remainder = total_num_gpus - sum(gpus)
-        if remainder > 0:
-            gpus[-1] += remainder
-        return gpus
-
-    @staticmethod
-    def _find_donor(
-        agents: List[str],
-        dp_results: Dict[str, Dict[int, InstanceAssignment]],
         gpus: List[int],
-        min_throughput: float,
+        dp_results: Dict[str, Dict[int, InstanceAssignment]],
         agent_invocations: Dict[str, float],
-        G: int = 1,
-    ) -> int:
-        """Find the best agent to donate `G` GPUs.
-
-        Returns the index of the agent whose throughput after losing `G` GPUs
-        remains the highest above the current minimum (most headroom).
-        """
-        best_idx = -1
-        max_diff = -1.0
-
+    ) -> List[float]:
+        throughputs: List[float] = []
         for i, agent in enumerate(agents):
-            if gpus[i] <= G:
-                continue  # Cannot donate below G GPUs
-
-            tp_after = (
-                dp_results[agent][gpus[i] - G].throughput
-                / agent_invocations[agent]
-            )
-            diff = tp_after - min_throughput
-            if diff > max_diff:
-                max_diff = diff
-                best_idx = i
-
-        return best_idx
+            invocations = float(agent_invocations.get(agent, 0.0))
+            if invocations <= 0:
+                throughputs.append(0.0)
+                continue
+            throughputs.append(dp_results[agent][gpus[i]].throughput /
+                               invocations)
+        return throughputs

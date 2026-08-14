@@ -1,9 +1,8 @@
 """Instance orchestrator for GPU-to-context-range assignment."""
 
 from dataclasses import dataclass, field
-from itertools import combinations
-from math import floor
-from typing import Dict, Iterable, List, Tuple
+import heapq
+from typing import Dict, List, Tuple
 
 
 @dataclass
@@ -18,11 +17,15 @@ class InstanceAssignment:
 class InstanceOrchestrator:
     """Determines GPU-to-context-range assignment.
 
-    For each candidate context partition scheme, the allocator first initializes
-    instance counts proportional to each partition's service demand
-    (inverse single-instance throughput), then greedily adjusts counts to match
-    the exact GPU budget.  This follows the two-step allocation described in the
-    paper: proportional assignment first, discrete budget correction second.
+    The algorithm follows the optimized-mapping path from the original
+    allocator:
+
+    1. Run a GPU-count-independent DP to select the best context partitioning
+       for each ``(num_groups, context_upper)``.  The DP minimizes the sum of
+       inverse single-instance throughput, which is equivalent to maximizing the
+       balanced throughput of a continuously divisible GPU budget.
+    2. For each concrete GPU budget, reconstruct each candidate partitioning
+       and greedily assign instances to the currently slowest partition.
     """
 
     def __init__(
@@ -59,118 +62,130 @@ class InstanceOrchestrator:
             and list of (gpus, lower_bound, upper_bound, throughput).
         """
         dn = self._dp_gpu_step
-        C = self.max_context_idx
-
-        # Collect best result for each reachable GPU count
-        reachable: Dict[int, InstanceAssignment] = {}
-        for g in range(dn, total_num_gpus + 1, dn):
-            best = InstanceAssignment()
-            for k in range(min_instance_group, max_instance_group + 1):
-                if k * dn > g:
-                    continue
-                for scheme in self._iter_partition_schemes(
-                    num_partitions=k,
-                    max_context_idx=C,
-                    throughput_cache=instance_throughput_cache,
-                ):
-                    assignment = self._allocate_scheme(
-                        scheme=scheme,
-                        total_num_gpus=g,
-                        gpu_step=dn,
-                    )
-                    if assignment.throughput > best.throughput:
-                        best = assignment
-            reachable[g] = best
-
-        # Fill result for all GPU counts (1..total_num_gpus)
         result: Dict[int, InstanceAssignment] = {}
-        prev = InstanceAssignment(throughput=0.0, instances=[])
-        for g in range(0, total_num_gpus + 1):
-            if g in reachable:
-                prev = reachable[g]
-            result[g] = prev
+        partition_plans = self._build_partition_plans(
+            instance_throughput_cache=instance_throughput_cache,
+            max_instance_group=max_instance_group,
+        )
+
+        for num_gpus in range(0, total_num_gpus + 1):
+            best = InstanceAssignment()
+            total_instances = num_gpus // dn
+            for num_groups in range(min_instance_group, max_instance_group + 1):
+                if total_instances < num_groups:
+                    continue
+                scheme = partition_plans.get(num_groups)
+                if not scheme:
+                    continue
+                assignment = self._allocate_instances_greedily(
+                    scheme=scheme,
+                    total_num_gpus=num_gpus,
+                    gpu_step=dn,
+                )
+                if assignment.throughput > best.throughput:
+                    best = assignment
+            result[num_gpus] = best
 
         return result
 
-    def _iter_partition_schemes(
+    def _build_partition_plans(
         self,
-        num_partitions: int,
-        max_context_idx: int,
-        throughput_cache: Dict[Tuple[int, int], float],
-    ) -> Iterable[List[Tuple[int, int, float]]]:
-        """Yield valid context partitions with per-partition throughput."""
-        if num_partitions == 1:
-            key = (0, max_context_idx)
-            throughput = throughput_cache.get(key, 0.0)
-            if throughput > 0:
-                yield [(0, max_context_idx, throughput)]
-            return
+        instance_throughput_cache: Dict[Tuple[int, int], float],
+        max_instance_group: int,
+    ) -> Dict[int, List[Tuple[int, int, float]]]:
+        """Run optimized-mapping DP and return plans ending at max context.
 
-        for boundaries in combinations(
-            range(1, max_context_idx),
-            num_partitions - 1,
-        ):
-            points = (0, *boundaries, max_context_idx)
-            scheme: List[Tuple[int, int, float]] = []
-            valid = True
-            for lo, hi in zip(points, points[1:]):
-                throughput = throughput_cache.get((lo, hi), 0.0)
-                if throughput <= 0:
-                    valid = False
-                    break
-                scheme.append((lo, hi, throughput))
-            if valid:
-                yield scheme
+        The DP state ``dp[k][c]`` stores the minimum sum of inverse throughput
+        needed to cover context range ``[0, c)`` with exactly ``k`` groups.  It
+        is independent of the number of GPUs available later.
+        """
+        max_context_idx = self.max_context_idx
+        valid_transitions: Dict[int, List[Tuple[int, float, float]]] = {}
+        for (lo_idx, hi_idx), throughput in instance_throughput_cache.items():
+            if throughput <= 0:
+                continue
+            valid_transitions.setdefault(hi_idx, []).append(
+                (lo_idx, 1.0 / throughput, throughput))
 
-    def _allocate_scheme(
+        inf = float("inf")
+        dp = [
+            [inf] * (max_context_idx + 1)
+            for _ in range(max_instance_group + 1)
+        ]
+        parent: Dict[Tuple[int, int], Tuple[int, float]] = {}
+        dp[0][0] = 0.0
+
+        for num_groups in range(1, max_instance_group + 1):
+            for context_idx in range(1, max_context_idx + 1):
+                for prev_idx, cost, throughput in valid_transitions.get(
+                        context_idx, []):
+                    prev_cost = dp[num_groups - 1][prev_idx]
+                    if prev_cost == inf:
+                        continue
+                    new_cost = prev_cost + cost
+                    if new_cost < dp[num_groups][context_idx]:
+                        dp[num_groups][context_idx] = new_cost
+                        parent[(num_groups, context_idx)] = (
+                            prev_idx, throughput)
+
+        plans: Dict[int, List[Tuple[int, int, float]]] = {}
+        for num_groups in range(1, max_instance_group + 1):
+            if dp[num_groups][max_context_idx] == inf:
+                continue
+            scheme = self._reconstruct_scheme(
+                parent=parent,
+                num_groups=num_groups,
+                context_idx=max_context_idx,
+            )
+            if scheme:
+                plans[num_groups] = scheme
+        return plans
+
+    @staticmethod
+    def _reconstruct_scheme(
+        parent: Dict[Tuple[int, int], Tuple[int, float]],
+        num_groups: int,
+        context_idx: int,
+    ) -> List[Tuple[int, int, float]]:
+        scheme: List[Tuple[int, int, float]] = []
+        cur_groups = num_groups
+        cur_context = context_idx
+        while cur_groups > 0:
+            entry = parent.get((cur_groups, cur_context))
+            if entry is None:
+                return []
+            prev_context, throughput = entry
+            scheme.append((prev_context, cur_context, throughput))
+            cur_context = prev_context
+            cur_groups -= 1
+        if cur_context != 0:
+            return []
+        scheme.reverse()
+        return scheme
+
+    def _allocate_instances_greedily(
         self,
         scheme: List[Tuple[int, int, float]],
         total_num_gpus: int,
         gpu_step: int,
     ) -> InstanceAssignment:
-        """Allocate instances for one partition scheme.
-
-        ``scheme`` entries are ``(lo_idx, hi_idx, single_instance_throughput)``.
-        Slower partitions receive a larger initial share because their inverse
-        throughput contributes more service demand.
-        """
-        total_instances = total_num_gpus // gpu_step
+        """Assign instances by repeatedly improving the bottleneck segment."""
         num_partitions = len(scheme)
+        total_instances = total_num_gpus // gpu_step
         if total_instances < num_partitions:
             return InstanceAssignment()
 
-        inverse_tp = [1.0 / throughput for _, _, throughput in scheme]
-        demand_sum = sum(inverse_tp)
-        raw_counts = [
-            total_instances * demand / demand_sum
-            for demand in inverse_tp
-        ]
-        counts = [max(1, floor(count)) for count in raw_counts]
+        counts = [1] * num_partitions
+        heap = [(scheme[idx][2], idx) for idx in range(num_partitions)]
+        heapq.heapify(heap)
 
-        while sum(counts) < total_instances:
-            bottleneck = min(
-                range(num_partitions),
-                key=lambda idx: counts[idx] * scheme[idx][2],
-            )
-            counts[bottleneck] += 1
-
-        while sum(counts) > total_instances:
-            candidates = [
-                idx for idx, count in enumerate(counts)
-                if count > 1
-            ]
-            if not candidates:
-                return InstanceAssignment()
-            victim = max(
-                candidates,
-                key=lambda idx: (counts[idx] - 1) * scheme[idx][2],
-            )
-            counts[victim] -= 1
+        for _ in range(total_instances - num_partitions):
+            _cur_tp, idx = heapq.heappop(heap)
+            counts[idx] += 1
+            heapq.heappush(heap, (counts[idx] * scheme[idx][2], idx))
 
         throughput = min(
-            counts[idx] * scheme[idx][2]
-            for idx in range(num_partitions)
-        )
+            counts[idx] * scheme[idx][2] for idx in range(num_partitions))
         instances = [
             (
                 counts[idx] * gpu_step,

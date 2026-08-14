@@ -12,7 +12,7 @@ from coreflow.predictor.interference import InterferencePredictor
 class LatencyPredictor:
     """Unified predictor for total per-iteration latency.
 
-    Composes attention, interference, and MLP latency components.
+    Composes attention, interference, and Llama non-attention layer components.
     All sub-models are lazy-loaded on first prediction.
     """
 
@@ -29,7 +29,12 @@ class LatencyPredictor:
         self._mlp_loaded: bool = False
 
     def _load_mlp(self) -> Dict[int, float]:
-        """Load MLP latency table (batch_size -> latency in seconds)."""
+        """Load per-layer non-attention latency table.
+
+        The persisted file keeps the historical ``mlp_profile.json`` name, but
+        each value is the latency of one Llama decoder layer excluding the
+        attention kernel.
+        """
         with open(self._mlp_profile_path, "r") as f:
             raw = json.load(f)
         return {int(bs): float(lat) for bs, lat in raw.items()}
@@ -74,9 +79,9 @@ class LatencyPredictor:
         Returns:
             Total iteration latency in seconds.
         """
-        # MLP component
+        # Llama per-layer non-attention component.
         total_batch = decode_batch_size + prefill_query_len
-        mlp_latency = self._predict_mlp(total_batch)
+        mlp_latency = num_layers * self._predict_mlp(total_batch)
 
         # Decode attention component
         decode_attn_latency = num_layers * self._attn.predict(

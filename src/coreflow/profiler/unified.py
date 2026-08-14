@@ -29,6 +29,7 @@ class UnifiedProfiler:
         num_heads: int = 32,
         num_kv_heads: int = 8,
         head_size: int = 128,
+        intermediate_size: int = 14336,
         total_num_blocks: int = 100_000,
         block_size: int = 16,
         device: str = "cuda:2",
@@ -39,6 +40,7 @@ class UnifiedProfiler:
         import torch
 
         _dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+        self._intermediate_size = intermediate_size
 
         self._attn = AttentionProfiler(
             num_heads=num_heads,
@@ -78,28 +80,92 @@ class UnifiedProfiler:
         }
 
     def profile_mlp(self, batch_sizes: Optional[list[int]] = None) -> dict:
+        """Profile one Llama decoder layer excluding the attention kernel.
+
+        The retained path follows the Llama layer structure with TP=PP=1:
+        input RMSNorm, qkv projection, rotary embedding, output projection,
+        post-attention RMSNorm, and the gated MLP (gate/up + SiLU + down).
+        It intentionally excludes the FlashAttention/PagedAttention kernel and
+        all-reduce costs.
+        """
         if batch_sizes is None:
-            batch_sizes = list(range(1, 65)) + [96, 128, 192, 256, 384, 512]
+            batch_sizes = list(range(32, 513, 32))
 
         hidden_size = self._attn.hidden_size
-        intermediate_size = hidden_size * 4
+        intermediate_size = self._intermediate_size
+        num_heads = self._attn._num_heads
+        num_kv_heads = self._attn._num_kv_heads
+        head_size = self._attn._head_size
+        q_size = num_heads * head_size
+        kv_size = num_kv_heads * head_size
+        qkv_size = q_size + 2 * kv_size
         device = self._attn.device
         dtype = self._attn.dtype
+        eps = 1e-6
 
-        w1 = torch.randn(
-            (hidden_size, intermediate_size), device=device, dtype=dtype,
-        )
-        w2 = torch.randn(
-            (intermediate_size, hidden_size), device=device, dtype=dtype,
-        )
+        def rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+            x_norm = x.float() * torch.rsqrt(variance + eps)
+            return (x_norm.to(dtype) * weight)
+
+        def apply_rotary(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            def rotate_half(x: torch.Tensor) -> torch.Tensor:
+                x1 = x[..., :head_size // 2]
+                x2 = x[..., head_size // 2:]
+                return torch.cat((-x2, x1), dim=-1)
+
+            cos = cos[:, None, :]
+            sin = sin[:, None, :]
+            return ((q * cos) + (rotate_half(q) * sin),
+                    (k * cos) + (rotate_half(k) * sin))
+
+        input_norm_weight = torch.ones(hidden_size, device=device, dtype=dtype)
+        post_attn_norm_weight = torch.ones(hidden_size, device=device, dtype=dtype)
+        qkv_weight = torch.randn(hidden_size, qkv_size, device=device, dtype=dtype)
+        o_proj_weight = torch.randn(q_size, hidden_size, device=device, dtype=dtype)
+        gate_up_weight = torch.randn(
+            hidden_size, 2 * intermediate_size, device=device, dtype=dtype)
+        down_weight = torch.randn(
+            intermediate_size, hidden_size, device=device, dtype=dtype)
 
         result: dict[str, float] = {}
         for batch_size in batch_sizes:
             x = torch.randn((batch_size, hidden_size), device=device, dtype=dtype)
+            residual = x
+            positions = torch.arange(batch_size, device=device, dtype=torch.float32)
+            freqs = torch.arange(0, head_size, 2, device=device, dtype=torch.float32)
+            inv_freq = 1.0 / (10000.0 ** (freqs / head_size))
+            freqs = torch.outer(positions, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos().to(dtype)
+            sin = emb.sin().to(dtype)
+            attn_output = torch.randn(
+                (batch_size, q_size), device=device, dtype=dtype)
 
             def forward():
-                y = torch.nn.functional.gelu(x @ w1)
-                y @ w2
+                with torch.no_grad():
+                    hidden = rms_norm(x, input_norm_weight)
+                    qkv = hidden @ qkv_weight
+                    q, k, _v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+                    q = q.view(batch_size, num_heads, head_size)
+                    k = k.view(batch_size, num_kv_heads, head_size)
+                    q, k = apply_rotary(q, k, cos, sin)
+
+                    # The attention kernel is excluded. Use a synthetic
+                    # attention output with the same shape as LlamaAttention.
+                    attn_projected = attn_output @ o_proj_weight
+
+                    hidden = attn_projected
+                    hidden = rms_norm(hidden + residual, post_attn_norm_weight)
+                    gate_up = hidden @ gate_up_weight
+                    gate, up = gate_up.chunk(2, dim=-1)
+                    hidden = torch.nn.functional.silu(gate) * up
+                    hidden @ down_weight
 
             result[str(batch_size)] = self._attn._measure_latency(forward)
 

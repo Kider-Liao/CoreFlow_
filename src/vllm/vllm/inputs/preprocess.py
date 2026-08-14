@@ -61,9 +61,7 @@ class InputPreprocessor:
                          lora_request: Optional[LoRARequest] = None
                          ) -> Optional[int]:
         if self.tokenizer is None:
-            logger.warning("Using None for EOS token id because tokenizer "
-                           "is not initialized")
-            return None
+            return -1
 
         return self.tokenizer.get_lora_tokenizer(lora_request).eos_token_id
 

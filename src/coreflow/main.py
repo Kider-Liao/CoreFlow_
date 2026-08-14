@@ -200,6 +200,7 @@ def run_profiling(cfg: WorkflowConfig, verify: bool = False) -> None:
         num_heads=cfg.model.num_heads,
         num_kv_heads=cfg.model.num_kv_heads,
         head_size=cfg.model.head_size,
+        intermediate_size=cfg.model.intermediate_size,
         device=cfg.hardware.device,
         dtype=cfg.hardware.dtype,
         warmup=cfg.profiler.warmup,

@@ -107,6 +107,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator, self.block_size, self.enable_caching)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
+        # [CoreFlow/T2] Synthetic prefix-cache hits used by reuse benchmarks.
+        # These entries mean the sequence owns real GPU blocks for the full
+        # prompt, and the first N tokens should be treated as already computed.
+        self._synthetic_cached_tokens: Dict[int, int] = {}
 
         # [Instance] Cached entries kept in GPU memory.
         # Key:   (query_id, invocation_id)
@@ -115,35 +119,23 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self._gpu_cached_entries: Dict[Tuple[int, int],
                                         Tuple[str, List[int],
                                               List[int]]] = {}
-        self.cached_dict: Dict[Tuple[int, int], str] = {}
-
-        # [Instance] Cached entries kept in CPU memory.
-        # Same structure as _gpu_cached_entries, but blocks have been swapped
-        # to CPU memory (not freed) for later prefix reuse.
-        self._cpu_cached_entries: Dict[Tuple[int, int],
-                                        Tuple[str, List[int],
-                                              List[int]]] = {}
-
-        # [Instance] Query-level FCFS + within-query LRU tracking.
-        # _query_timestamps:  query_id -> registration epoch.
-        self._query_timestamps: Dict[int, float] = {}
-        # _entry_access:       (query_id, invocation_id) → last_access epoch.
-        #                     Updated on cache hit (LRU tracking).
-        self._entry_access: Dict[Tuple[int, int], float] = {}
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
-                     num_lookahead_slots: int = 0) -> AllocStatus:
+                     num_lookahead_slots: int = 0
+                     ) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
 
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-        num_required_blocks = BlockTable.get_num_required_blocks(
-            seq.get_token_ids(),
-            block_size=self.block_size,
+        token_ids = seq.get_token_ids()
+        num_required_blocks = self.block_allocator.get_num_new_blocks_needed(
+            token_ids=token_ids,
+            extra_hash=seq.extra_hash(),
             num_lookahead_slots=num_lookahead_slots,
+            block_size=self.block_size,
         )
 
         if seq_group.is_encoder_decoder():
@@ -152,6 +144,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             num_required_blocks += BlockTable.get_num_required_blocks(
                 encoder_seq.get_token_ids(),
                 block_size=self.block_size,
+                num_lookahead_slots=0,
             )
 
         if self.max_block_sliding_window is not None:
@@ -170,6 +163,70 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         else:
             return AllocStatus.LATER
 
+    def _swap_in_cpu_prefix_if_needed(
+            self, seq: Sequence) -> List[Tuple[int, int]]:
+        """Make CPU-cached prefix blocks available in the GPU prefix cache.
+
+        If the sequence has more cached prefix on CPU than on GPU, the missing
+        CPU blocks are swapped into the GPU allocator and marked computed. The
+        returned CPU -> GPU physical block mapping must be passed to the worker
+        so the actual KV tensors are copied; the allocator update alone only
+        moves metadata.
+        """
+        if not self.enable_caching:
+            return []
+
+        gpu_cached_tokens = self.get_num_cached_tokens(
+            seq, device=Device.GPU)
+        cpu_cached_tokens = self.get_num_cached_tokens(
+            seq, device=Device.CPU)
+        if (cpu_cached_tokens <= gpu_cached_tokens or cpu_cached_tokens <= 0):
+            return []
+
+        prefix_token_ids = seq.get_token_ids()[:cpu_cached_tokens]
+        if not prefix_token_ids:
+            return []
+
+        cpu_block_table = BlockTable(
+            block_size=self.block_size,
+            block_allocator=self.block_allocator,
+            max_block_sliding_window=self.max_block_sliding_window,
+        )
+        cpu_block_table.allocate(token_ids=prefix_token_ids,
+                                 device=Device.CPU,
+                                 extra_hash=seq.extra_hash())
+
+        blocks = cpu_block_table.blocks
+        start_block_idx = gpu_cached_tokens // self.block_size
+        blocks_to_swap = blocks[start_block_idx:]
+        seq_swap_mapping = self.block_allocator.swap(
+            blocks=blocks_to_swap,
+            src_device=Device.CPU,
+            dst_device=Device.GPU,
+        )
+
+        gpu_block_ids = [
+            block.block_id for block in blocks_to_swap
+            if block.block_id is not None
+        ]
+        if gpu_block_ids:
+            self.block_allocator.mark_blocks_as_computed(gpu_block_ids)
+        self._computed_blocks_tracker.update_num_cached_tokens(
+            seq, cpu_cached_tokens, Device.GPU)
+
+        # Release the temporary block objects. The physical GPU blocks are now
+        # registered in the GPU prefix cache and can be found by BlockTable.
+        cpu_block_table.free()
+
+        physical_block_id_mapping: List[Tuple[int, int]] = []
+        for cpu_block_id, gpu_block_id in seq_swap_mapping.items():
+            physical_block_id_mapping.append(
+                (self.block_allocator.get_physical_block_id(
+                    Device.CPU, cpu_block_id),
+                 self.block_allocator.get_physical_block_id(
+                    Device.GPU, gpu_block_id)))
+        return physical_block_id_mapping
+
     def _allocate_sequence(self, seq: Sequence) -> BlockTable:
         block_table = BlockTable(
             block_size=self.block_size,
@@ -187,7 +244,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         return block_table
 
-    def allocate(self, seq_group: SequenceGroup) -> None:
+    def allocate(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
 
         # Allocate self-attention block tables for decoder sequences
         waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
@@ -199,6 +256,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         seq = waiting_seqs[0]
         block_table: BlockTable = self._allocate_sequence(seq)
         self.block_tables[seq.seq_id] = block_table
+
+        # The block table is now allocated and its immutable prefix blocks are
+        # registered in the GPU prefix cache. Bring any longer CPU-cached prefix
+        # into those same GPU blocks; the returned mapping is passed to the
+        # worker for the actual KV copy.
+        blocks_to_swap_in = self._swap_in_cpu_prefix_if_needed(seq)
 
         # Track seq
         self._last_access_blocks_tracker.add_seq(seq.seq_id)
@@ -227,6 +290,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             assert encoder_seq is not None
             block_table = self._allocate_sequence(encoder_seq)
             self.cross_block_tables[request_id] = block_table
+
+        return blocks_to_swap_in
 
     def can_append_slots(self, seq_group: SequenceGroup,
                          num_lookahead_slots: int) -> bool:
@@ -289,6 +354,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Untrack seq
         self._last_access_blocks_tracker.remove_seq(seq_id)
         self._computed_blocks_tracker.remove_seq(seq_id)
+        self._synthetic_cached_tokens.pop(seq_id, None)
 
         # Free table/blocks
         self.block_tables[seq_id].free()
@@ -297,6 +363,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def remove_seq_from_computed_blocks_tracker(self, seq: Sequence) -> None:
         seq_id = seq.seq_id
         self._computed_blocks_tracker.remove_seq(seq_id)
+        self._synthetic_cached_tokens.pop(seq_id, None)
 
     def free_cross(self, seq_group: SequenceGroup) -> None:
         request_id = seq_group.request_id
@@ -329,11 +396,56 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
     def mark_blocks_as_computed(self, seq_group: SequenceGroup,
                                 token_chunk_size: int):
-        # If prefix caching is enabled, mark immutable blocks as computed
-        # right after they have been scheduled (for prefill). This assumes
-        # the scheduler is synchronous so blocks are actually computed when
-        # scheduling the next batch.
-        self.block_allocator.mark_blocks_as_computed([])
+        """Mark only the blocks that were actually computed in this step."""
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            block_table = self.block_tables.get(seq.seq_id)
+            if block_table is None:
+                continue
+
+            computed_after = min(seq.get_len(),
+                                 seq.data.get_num_computed_tokens() +
+                                 token_chunk_size)
+            num_computed_blocks = computed_after // self.block_size
+            block_ids = block_table.physical_block_ids[:num_computed_blocks]
+            block_ids = [
+                block_id for block_id in block_ids if block_id is not None
+            ]
+            if block_ids:
+                self.block_allocator.mark_blocks_as_computed(block_ids)
+
+    def register_synthetic_cached_tokens(self, seq: Sequence,
+                                         cached_tokens: int) -> int:
+        """Mark an allocated prompt prefix as already computed.
+
+        This is used by CoreFlow's T2 synthetic KV-reuse benchmark.  The block
+        table is allocated for the full prompt, but prefill should start after
+        the cached prefix.  Prefix-cache attention only supports full blocks, so
+        the effective cache length is rounded down to a block boundary.
+        """
+        seq_id = seq.seq_id
+        block_table = self.block_tables.get(seq_id)
+        if block_table is None:
+            return 0
+
+        effective_tokens = min(max(cached_tokens, 0), seq.get_prompt_len())
+        effective_tokens = (effective_tokens // self.block_size) * self.block_size
+        if effective_tokens <= 0:
+            self._synthetic_cached_tokens.pop(seq_id, None)
+            return 0
+
+        num_cached_blocks = effective_tokens // self.block_size
+        block_ids = block_table.physical_block_ids[:num_cached_blocks]
+        block_ids = [block_id for block_id in block_ids if block_id is not None]
+        if len(block_ids) != num_cached_blocks:
+            effective_tokens = len(block_ids) * self.block_size
+
+        if effective_tokens <= 0:
+            self._synthetic_cached_tokens.pop(seq_id, None)
+            return 0
+
+        self._synthetic_cached_tokens[seq_id] = effective_tokens
+        self.block_allocator.mark_blocks_as_computed(block_ids)
+        return effective_tokens
 
     def get_common_computed_block_ids(
             self, seqs: List[Sequence]) -> GenericSequence[int]:
@@ -347,16 +459,35 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         sequences in the sequence group.
         """
         computed_seq_block_ids = []
+        has_synthetic_cache = False
         for seq in seqs:
             all_blocks = self.block_tables[seq.seq_id].physical_block_ids
-            num_cached_tokens = (
-                self._computed_blocks_tracker.get_num_cached_tokens(seq))
+            num_cached_tokens = self._synthetic_cached_tokens.get(seq.seq_id)
+            if num_cached_tokens is not None:
+                has_synthetic_cache = True
+            else:
+                num_cached_tokens = (
+                    self._computed_blocks_tracker.get_num_cached_tokens(seq))
             assert num_cached_tokens % self.block_size == 0
             num_cached_blocks = num_cached_tokens // self.block_size
             computed_block_ids = all_blocks[:num_cached_blocks]
             computed_seq_block_ids.append(computed_block_ids)
 
         # NOTE(sang): This assumes seq_block_ids doesn't contain any None.
+        if has_synthetic_cache:
+            if not computed_seq_block_ids:
+                return []
+            common_len = min(len(block_ids) for block_ids in computed_seq_block_ids)
+            common_block_ids = []
+            for idx in range(common_len):
+                block_id = computed_seq_block_ids[0][idx]
+                if block_id is None or any(
+                        blocks[idx] != block_id
+                        for blocks in computed_seq_block_ids[1:]):
+                    break
+                common_block_ids.append(block_id)
+            return common_block_ids
+
         return self.block_allocator.get_common_computed_block_ids(
             computed_seq_block_ids)  # type: ignore
 
@@ -383,8 +514,44 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         Returns:
             AllocStatus: The AllocStatus for the given sequence group.
         """
+        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+            block_table = self.block_tables.get(seq.seq_id)
+            if block_table is None:
+                return AllocStatus.NEVER
+            for block in block_table.blocks:
+                block_id = block.block_id
+                if block_id is None or not self.block_allocator.is_block_active(
+                        block_id):
+                    return AllocStatus.NEVER
         return self._can_swap(seq_group, Device.GPU, SequenceStatus.SWAPPED,
                               num_lookahead_slots)
+
+    def _collect_blocks_for_swap(
+        self,
+        seq_group: SequenceGroup,
+        status: Optional[SequenceStatus],
+    ) -> List[Tuple[Sequence, List[Block]]]:
+        seqs = (seq_group.get_seqs(status=status) if status is not None
+                else seq_group.get_seqs())
+        pending: List[Tuple[Sequence, List[Block]]] = []
+        for seq in seqs:
+            block_table = self.block_tables.get(seq.seq_id)
+            if block_table is None:
+                continue
+            blocks = block_table.blocks
+            if not blocks:
+                continue
+            if not self.enable_caching:
+                selected_blocks = list(blocks)
+            else:
+                selected_blocks = [
+                    block for block in blocks
+                    if block.is_full and block.block_id is not None
+                    and self.block_allocator.is_block_computed(block.block_id)
+                ]
+            if selected_blocks:
+                pending.append((seq, selected_blocks))
+        return pending
 
     def swap_in(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
         """Returns the block id mapping (from CPU to GPU) generated by
@@ -435,9 +602,16 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         Returns:
             bool: Whether it's possible to swap out current sequence group.
         """
-        alloc_status = self._can_swap(seq_group, Device.CPU,
-                                      SequenceStatus.RUNNING)
-        return alloc_status == AllocStatus.OK
+        pending = self._collect_blocks_for_swap(seq_group,
+                                                SequenceStatus.RUNNING)
+        if not pending:
+            return True
+        needed_cpu_blocks = 0
+        for _, blocks in pending:
+            needed_cpu_blocks += self.block_allocator.get_num_full_blocks_touched(
+                blocks, device=Device.CPU)
+        return needed_cpu_blocks <= self.block_allocator.get_num_free_blocks(
+            Device.CPU)
 
     def swap_out(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
         """Returns the block id mapping (from GPU to CPU) generated by
@@ -450,31 +624,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             List[Tuple[int, int]]: The mapping of swapping block from 
                 GPU to CPU.
         """
-        physical_block_id_mapping = []
-        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
-            blocks = self.block_tables[seq.seq_id].blocks
-            if len(blocks) == 0:
-                continue
-
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.GPU,
-                                                         dst_device=Device.CPU)
-
-            # Refresh the block ids of the table (post-swap)
-            self.block_tables[seq.seq_id].update(blocks)
-
-            seq_physical_block_id_mapping = {
-                self.block_allocator.get_physical_block_id(
-                    Device.GPU, gpu_block_id):
-                self.block_allocator.get_physical_block_id(
-                    Device.CPU, cpu_block_id)
-                for gpu_block_id, cpu_block_id in seq_swap_mapping.items()
-            }
-
-            physical_block_id_mapping.extend(
-                list(seq_physical_block_id_mapping.items()))
-
-        return physical_block_id_mapping
+        mapping = self._swap_out_group(seq_group, SequenceStatus.RUNNING)
+        if mapping is None:
+            return []
+        return mapping
 
     def get_num_free_gpu_blocks(self) -> int:
         return self.block_allocator.get_num_free_blocks(Device.GPU)
@@ -570,180 +723,86 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         for seq in seq_group.get_seqs():
             if seq.is_finished():
                 seq_ids.append(seq.seq_id)
-                token_ids = seq.get_output_token_ids()
+                if not token_ids:
+                    token_ids = seq.get_token_ids()
 
         self._gpu_cached_entries[key] = (seq_group.request_id, seq_ids, token_ids)
-        self.cached_dict[key] = seq_group.request_id
-        # Track access timestamps for FCFS+LRU eviction
-        now = time.time()
-        self._entry_access[key] = now
-        if query_id not in self._query_timestamps:
-            self._query_timestamps[query_id] = now
 
     # [Instance] CPU cache  ----------------------------------------------------
 
-    def swap_out_finished(self, seq_group: SequenceGroup) -> bool:
+    def swap_out_finished(
+            self, seq_group: SequenceGroup) -> Optional[List[Tuple[int, int]]]:
         """Swap a finished seq_group's blocks from GPU to CPU memory.
 
-        Called when reusable cache should remain in CPU memory. Blocks are
-        moved to CPU (not freed) for later prefix-cache reuse.
-
-        If CPU memory is exhausted, blocks are freed as a fallback.
-
-        Returns True when at least one finished sequence was successfully
-        swapped to CPU and can be registered as CPU-cached.
+        Returns the GPU -> CPU physical block mapping so the scheduler can pass
+        it to the worker for the real KV tensor copy. Returns ``None`` when CPU
+        swap space is insufficient, in which case the caller should free the
+        blocks instead.
         """
-        swapped_any = False
-        for seq in seq_group.get_seqs():
-            if seq.seq_id not in self.block_tables:
-                continue
-            blocks = self.block_tables[seq.seq_id].blocks
-            if blocks is None or len(blocks) == 0:
-                continue
-            try:
-                self.block_allocator.swap(
-                    blocks=blocks,
-                    src_device=Device.GPU,
-                    dst_device=Device.CPU,
-                )
-                self.block_tables[seq.seq_id].update(blocks)
-                swapped_any = True
-            except Exception:
-                # CPU OOM fallback: free the blocks
-                for block in blocks:
-                    self.block_allocator.free(block)
-        return swapped_any
+        return self._swap_out_group(seq_group, None)
 
-    def register_cpu_cache(self, seq_group: SequenceGroup) -> None:
-        """Register a finished seq_group's blocks as CPU-cached.
+    def _swap_out_group(
+        self,
+        seq_group: SequenceGroup,
+        status: Optional[SequenceStatus],
+    ) -> Optional[List[Tuple[int, int]]]:
+        pending = self._collect_blocks_for_swap(seq_group, status)
 
-        Called after :meth:`swap_out_finished`.  Records the mapping so that
-        future requests with the same ``(query_id, invocation_id)`` can swap
-        the blocks back from CPU to GPU.
-        """
-        sp = seq_group.sampling_params
-        if sp is None or sp.extra_args is None:
-            return
-        query_id = sp.extra_args.get("query_id")
-        invocation_id = sp.extra_args.get("invocation_id")
-        if query_id is None or invocation_id is None:
-            return
+        if not pending:
+            return None
 
-        key = (int(query_id), int(invocation_id))
-        # Evict stale entry (both GPU and CPU)
-        self.evict_cached_blocks(key)
+        needed_cpu_blocks = 0
+        for _, blocks in pending:
+            needed_cpu_blocks += self.block_allocator.get_num_full_blocks_touched(
+                blocks, device=Device.CPU)
+        if needed_cpu_blocks > self.block_allocator.get_num_free_blocks(
+                Device.CPU):
+            return None
 
-        seq_ids: List[int] = []
-        token_ids: List[int] = []
-        for seq in seq_group.get_seqs():
-            if seq.is_finished():
-                seq_ids.append(seq.seq_id)
-                token_ids = seq.get_output_token_ids()
-
-        self._cpu_cached_entries[key] = (seq_group.request_id, seq_ids, token_ids)
-        # Track access timestamps for FCFS+LRU eviction
-        now = time.time()
-        self._entry_access[key] = now
-        if query_id not in self._query_timestamps:
-            self._query_timestamps[query_id] = now
-
-    def swap_in_cached(self, seq_ids: List[int]) -> List[Tuple[int, int]]:
-        """Swap CPU-cached blocks back to GPU for prefix reuse.
-
-        Returns:
-            List of (cpu_block_id, gpu_block_id) mappings.
-        """
         physical_block_id_mapping: List[Tuple[int, int]] = []
-        for seq_id in seq_ids:
-            if seq_id not in self.block_tables:
-                continue
-            blocks = self.block_tables[seq_id].blocks
-            if blocks is None or len(blocks) == 0:
-                continue
+        for seq, blocks in pending:
+            self.block_allocator.mark_blocks_as_accessed(
+                self.block_tables[seq.seq_id].physical_block_ids, time.time())
             seq_swap_mapping = self.block_allocator.swap(
                 blocks=blocks,
-                src_device=Device.CPU,
-                dst_device=Device.GPU,
+                src_device=Device.GPU,
+                dst_device=Device.CPU,
             )
-            self.block_tables[seq_id].update(blocks)
-            seq_mapping = [
-                (self.block_allocator.get_physical_block_id(Device.CPU, cpu_id),
-                 self.block_allocator.get_physical_block_id(Device.GPU, gpu_id))
-                for cpu_id, gpu_id in seq_swap_mapping.items()
-            ]
-            physical_block_id_mapping.extend(seq_mapping)
+            self.block_tables[seq.seq_id].update(blocks)
+
+            for gpu_block_id, cpu_block_id in seq_swap_mapping.items():
+                physical_block_id_mapping.append(
+                    (self.block_allocator.get_physical_block_id(
+                        Device.GPU, gpu_block_id),
+                     self.block_allocator.get_physical_block_id(
+                        Device.CPU, cpu_block_id)))
         return physical_block_id_mapping
 
-    # [Instance] Unified cache lookup  -----------------------------------------
-
-    def lookup_cache(self, query_id: int,
-                     invocation_id: int) -> Optional[Tuple[str, List[int]]]:
-        """Check GPU cached_dict.  (Backward-compatible)."""
+    def get_gpu_cached_entry(
+            self, query_id: int,
+            invocation_id: int) -> Optional[Tuple[str, List[int]]]:
         entry = self._gpu_cached_entries.get((query_id, invocation_id))
-        if entry is not None:
-            request_id, _seq_ids, token_ids = entry
-            return (request_id, token_ids)
-        return None
+        if entry is None:
+            return None
+        request_id, _seq_ids, token_ids = entry
+        return request_id, token_ids
 
-    def lookup_any_cache(
+    def get_gpu_cached_entry_keys(self) -> List[Tuple[int, int]]:
+        """Return all retained exact GPU-cache keys for routing queries."""
+        return list(self._gpu_cached_entries.keys())
+
+    def consume_gpu_cached_entry(
             self, query_id: int,
-            invocation_id: int) -> Optional[Tuple[str, List[int], bool]]:
-        """Check GPU + CPU caches.
-
-        Returns:
-            ``(request_id, token_ids, is_gpu)`` or ``None``.
-            ``is_gpu=True`` means blocks are already in GPU memory.
-        """
+            invocation_id: int) -> Optional[Tuple[str, List[int]]]:
+        """Consume an exact GPU cache hit and release the old block owner."""
         key = (query_id, invocation_id)
-        gpu_entry = self._gpu_cached_entries.get(key)
-        if gpu_entry is not None:
-            request_id, _seq_ids, token_ids = gpu_entry
-            return (request_id, token_ids, True)
-        cpu_entry = self._cpu_cached_entries.get(key)
-        if cpu_entry is not None:
-            request_id, _seq_ids, token_ids = cpu_entry
-            return (request_id, token_ids, False)
-        return None
-
-    def consume_cached(
-            self, query_id: int,
-            invocation_id: int) -> Optional[Tuple[str, List[int], bool]]:
-        """Consume a cached entry — swaps CPU→GPU if needed, then frees blocks.
-
-        This implements project.md point 4:
-        - GPU hit: blocks already in GPU → free old block_tables so the
-          finished request is cleaned up after prefix reuse.
-        - CPU hit: swap blocks CPU→GPU → free old block_tables.
-
-        vLLM's prefix-caching allocator (called later in ``_schedule_prefills``)
-        will find these blocks by hash and reuse them automatically.
-
-        Returns:
-            ``(request_id, token_ids, is_gpu)`` or ``None``.
-        """
-        key = (query_id, invocation_id)
-
-        # Remove LRU tracking for consumed entry
-        self._entry_access.pop(key, None)
-
-        # Check GPU first
         gpu_entry = self._gpu_cached_entries.pop(key, None)
-        if gpu_entry is not None:
-            _request_id, seq_ids, token_ids = gpu_entry
-            self.cached_dict.pop(key, None)
-            self._free_cached_seq_blocks(seq_ids)
-            self._maybe_cleanup_query(key[0])
-            return (_request_id, token_ids, True)
+        if gpu_entry is None:
+            return None
 
-        # Check CPU
-        cpu_entry = self._cpu_cached_entries.pop(key, None)
-        if cpu_entry is not None:
-            _request_id, seq_ids, token_ids = cpu_entry
-            self.swap_in_cached(seq_ids)       # CPU → GPU
-            self._free_cached_seq_blocks(seq_ids)  # free old block_tables
-            self._maybe_cleanup_query(key[0])
-            return (_request_id, token_ids, False)
-        return None
+        request_id, seq_ids, token_ids = gpu_entry
+        self._free_cached_seq_blocks(seq_ids)
+        return request_id, token_ids
 
     def _free_cached_seq_blocks(self, seq_ids: List[int]) -> None:
         """Free :attr:`block_tables` for a list of cached seq_ids."""
@@ -761,8 +820,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def free_request_cache(self, seq_group: SequenceGroup) -> None:
         """Release retained cache for a completed request key.
 
-        When ``free_cache=True``, both GPU and CPU cached entries for
-        ``(query_id, invocation_id)`` must be removed. The currently finished
+        When ``free_cache=True``, the retained GPU exact entry for
+        ``(query_id, invocation_id)`` is removed. The currently finished
         seq_group is freed by the scheduler after this method returns.
         """
         sp = seq_group.sampling_params
@@ -776,145 +835,18 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
     def evict_cached_blocks(self, key: Tuple[int, int]) -> None:
         """Evict cached entries from both GPU and CPU, freeing their blocks."""
-        # Clean up tracking
-        self._entry_access.pop(key, None)
-
         gpu_entry = self._gpu_cached_entries.pop(key, None)
         if gpu_entry is not None:
             _request_id, seq_ids, _token_ids = gpu_entry
-            self.cached_dict.pop(key, None)
             self._free_cached_seq_blocks(seq_ids)
-
-        cpu_entry = self._cpu_cached_entries.pop(key, None)
-        if cpu_entry is not None:
-            _request_id, seq_ids, _token_ids = cpu_entry
-            self._free_cached_seq_blocks(seq_ids)
-
-        self.cached_dict.pop(key, None)
-        self._maybe_cleanup_query(key[0])
-
-    # [Instance] Query FCFS + within-query LRU helpers  -----------------------
-
-    def _maybe_cleanup_query(self, query_id: int) -> None:
-        """Remove query timestamp if this query has no more cached entries."""
-        for (qid, _iid) in self._gpu_cached_entries:
-            if qid == query_id:
-                return
-        for (qid, _iid) in self._cpu_cached_entries:
-            if qid == query_id:
-                return
-        self._query_timestamps.pop(query_id, None)
-
-    def _collect_query_entries(
-        self, query_id: int, gpu_only: bool = False
-    ) -> List[Tuple[Tuple[int, int], bool]]:
-        """Return all cached entries for a query, sorted by LRU (oldest first).
-
-        Returns:
-            List of ((query_id, invocation_id), is_gpu) sorted by
-            last_access_time ascending (LRU = oldest first for eviction).
-        """
-        entries: List[Tuple[Tuple[int, int], bool, float]] = []
-        for key in self._gpu_cached_entries:
-            if key[0] == query_id:
-                ts = self._entry_access.get(key, 0)
-                entries.append((key, True, ts))
-        if not gpu_only:
-            for key in self._cpu_cached_entries:
-                if key[0] == query_id:
-                    ts = self._entry_access.get(key, 0)
-                    entries.append((key, False, ts))
-        # Sort by timestamp ascending (LRU: oldest → evict first)
-        entries.sort(key=lambda x: x[2])
-        return [(key, is_gpu) for key, is_gpu, _ts in entries]
-
-    def _demote_gpu_cache_to_cpu(self, key: Tuple[int, int]) -> None:
-        """Move one retained GPU cache entry to the CPU cache pool.
-
-        This is the memory-pressure path: the cache is evicted from GPU in
-        query-FCFS / invocation-LRU order but remains reusable from CPU if CPU
-        swap space is available.
-        """
-        gpu_entry = self._gpu_cached_entries.pop(key, None)
-        if gpu_entry is None:
-            return
-
-        request_id, seq_ids, token_ids = gpu_entry
-        self.cached_dict.pop(key, None)
-
-        stale_cpu = self._cpu_cached_entries.pop(key, None)
-        if stale_cpu is not None:
-            _old_request_id, old_seq_ids, _old_token_ids = stale_cpu
-            self._free_cached_seq_blocks(old_seq_ids)
-
-        swapped_any = False
-        try:
-            for seq_id in seq_ids:
-                if seq_id not in self.block_tables:
-                    continue
-                blocks = self.block_tables[seq_id].blocks
-                if blocks is None or len(blocks) == 0:
-                    continue
-                self.block_allocator.swap(
-                    blocks=blocks,
-                    src_device=Device.GPU,
-                    dst_device=Device.CPU,
-                )
-                self.block_tables[seq_id].update(blocks)
-                swapped_any = True
-        except Exception:
-            swapped_any = False
-
-        if swapped_any:
-            self._cpu_cached_entries[key] = (request_id, seq_ids, token_ids)
-            self._entry_access.setdefault(key, time.time())
-            if key[0] not in self._query_timestamps:
-                self._query_timestamps[key[0]] = self._entry_access[key]
-        else:
-            self._entry_access.pop(key, None)
-            self._free_cached_seq_blocks(seq_ids)
-            self._maybe_cleanup_query(key[0])
-
-    def evict_by_fcfs_lru(self, target_blocks: int = 1) -> int:
-        """Evict cached entries following query-FCFS + within-query LRU.
-
-        Eviction order:
-          1. Pick the smallest query_id.
-          2. Within that query, evict the LRU invocation (oldest last-access).
-          3. Repeat until *target_blocks* have been freed or no entries remain.
-
-        Args:
-            target_blocks: Minimum number of GPU blocks to free.
-
-        Returns:
-            Number of blocks actually freed.
-        """
-        freed = 0
-        sorted_queries = sorted(self._query_timestamps.keys())
-
-        for query_id in sorted_queries:
-            if freed >= target_blocks:
-                break
-            entries = self._collect_query_entries(query_id, gpu_only=True)
-            for key, is_gpu in entries:
-                if freed >= target_blocks:
-                    break
-                # Count blocks before eviction
-                before = self.block_allocator.get_num_free_blocks(Device.GPU)
-                self._demote_gpu_cache_to_cpu(key)
-                after = self.block_allocator.get_num_free_blocks(Device.GPU)
-                freed += max(0, after - before)
-
-        return freed
 
     # [Instance] Free finished blocks  ----------------------------------------
 
     def free_finished_blocks(self, seq_group: SequenceGroup) -> None:
         """Free blocks of a finished seq_group without caching.
 
-        Evicts any existing GPU/CPU cache entry for this
-        ``(query_id, invocation_id)`` so completed requests do not hold memory
-        indefinitely.
+        Evicts any existing GPU exact cache entry for this key so completed
+        requests do not hold memory indefinitely.
         """
         sp = seq_group.sampling_params
         if sp is None or sp.extra_args is None:
@@ -927,8 +859,39 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         key = (int(query_id), int(invocation_id))
         self.evict_cached_blocks(key)  # free any existing cached entry
 
-    def get_num_cached_tokens(self, seq: Sequence) -> int:
+    def get_num_cached_tokens(self,
+                              seq: Sequence,
+                              device: Device = Device.GPU) -> int:
         """Get the number of tokens in blocks that are already computed and
         cached in the block manager for the sequence.
         """
-        return self._computed_blocks_tracker.get_num_cached_tokens(seq)
+        return self._computed_blocks_tracker.get_num_cached_tokens(
+            seq, device=device)
+
+    def get_cached_block_hashes(self, device: Device) -> List[int]:
+        """Return all content hashes tracked by the selected block allocator."""
+        return self.block_allocator.get_cached_block_hashes(device)
+
+    def get_num_actually_cached_cpu_tokens(self, seq: Sequence) -> int:
+        """Return the contiguous CPU prefix still owned by this sequence."""
+        block_table = self.block_tables.get(seq.seq_id)
+        if block_table is None:
+            return 0
+
+        num_cached_blocks = 0
+        for block in block_table.blocks:
+            block_id = block.block_id
+            if block_id is None or not self.block_allocator.is_block_active(
+                    block_id):
+                break
+            num_cached_blocks += 1
+        return num_cached_blocks * self.block_size
+
+    def refresh_swapped_cached_tokens(self, seq_group: SequenceGroup) -> None:
+        """Refresh CPU cached-token counts for a swapped sequence group."""
+        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+            cpu_cached_tokens = self.get_num_actually_cached_cpu_tokens(seq)
+            self._computed_blocks_tracker.update_num_cached_tokens(
+                seq, cpu_cached_tokens, Device.CPU)
+            self._computed_blocks_tracker.update_num_cached_tokens(
+                seq, 0, Device.GPU)

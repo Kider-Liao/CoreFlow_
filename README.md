@@ -52,15 +52,30 @@ T1: heterogeneous request interference analysis:
 
 ```bash
 python scripts/interference_analyze.py \
-  --node-list data/React/node_list.json \
   --kernel FlashAttention \
-  --model Llama-3-8B
+  --model Llama-3-8B \
+  --device cuda:0 \
+  --out-dir results/t1_interference
 ```
 
 T2: cache reuse throughput benefit analysis:
 
 ```bash
-python scripts/reuse_benefits.py
+bash scripts/reuse_benefits.sh
+```
+
+The T2 wrapper defaults to the full CUDA graph run with
+`max_model_len=32768`, `gpu_memory_utilization=0.9`, `rate=5`,
+`duration=300`, `output_tokens=106`, and queue statistics enabled in
+`results/t2_throughput/instance.log`. Extra arguments are passed through to
+`scripts/reuse_benefits.py`, for example:
+
+```bash
+bash scripts/reuse_benefits.sh \
+  --out-dir results/t2_throughput_debug \
+  --input-tokens 2000 \
+  --ratios 0.5 \
+  --duration 60
 ```
 
 T3: offline profiling, controller startup, and workload generation:

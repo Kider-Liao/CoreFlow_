@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Token blocks."""
 import sys
+import hashlib
 from bisect import bisect_left
 from os.path import commonprefix
 from typing import (Callable, Dict, FrozenSet, Iterable, List, Optional, Set,
@@ -18,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.sequence import Sequence
 
 PrefixHash = int
+_NONE_HASH: int = -(1 << 63)
 
 # By default, we init our block access time as _DEFAULT_LAST_ACCESSED_TIME
 # so that if we find one block is still hold _DEFAULT_LAST_ACCESSED_TIME,
@@ -72,7 +74,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
     # collisions. 'None' as a string will be hashed differently per process,
     # but consistently within the same process. This is the same as the
     # behavior of None prior to Python 3.12.
-    _none_hash: int = hash('None')
+    _none_hash: int = _NONE_HASH
 
     # Implements Block.Factory.
     def __init__(
@@ -484,6 +486,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert block.content_hash is not None
         return block.content_hash in self._cached_blocks
 
+    def is_block_active(self, block_id: int) -> bool:
+        return self._block_tracker[block_id].active
+
     def promote_to_immutable_block(self, block: Block) -> BlockId:
         """Once a mutable block is full, it can be promoted to an immutable
         block. This means that its content can be referenced by future blocks
@@ -579,10 +584,15 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                     "Mark block as accessed which is not belonged to GPU")
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
-        # Mark all touched blocks as computed.
-        for block_id in self._touched_blocks:
+        # Mark explicitly requested blocks, or all touched blocks when called
+        # from the regular scheduler path.
+        target_block_ids = block_ids if block_ids else self._touched_blocks
+        for block_id in target_block_ids:
             self._block_tracker[block_id].computed = True
-        self._touched_blocks.clear()
+        if block_ids:
+            self._touched_blocks.difference_update(block_ids)
+        else:
+            self._touched_blocks.clear()
 
     def _track_block_id(self, block_id: Optional[BlockId],
                         computed: bool) -> None:
@@ -723,6 +733,49 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                            key=lambda x: not _block_is_cached(x))
         return block_hashes[:idx]
 
+    def get_cached_block_hashes(self) -> List[int]:
+        """Return all content hashes currently tracked by this allocator."""
+        return list(self._cached_blocks.keys())
+
+    def count_new_blocks_for_token_ids(
+            self,
+            token_ids: List[int],
+            extra_hash: Optional[int] = None,
+    ) -> int:
+        """Return how many physical blocks allocation will actually consume.
+
+        Blocks already active in this allocator do not consume a free/evictor
+        block when reacquired. Blocks found in the evictor still consume one
+        free/evictor slot, so they are counted as new for admission checks.
+        """
+        needed = 0
+        prev_block_hash: Optional[PrefixHash] = None
+
+        for start in range(0, len(token_ids), self._block_size):
+            block_token_ids = token_ids[start:start + self._block_size]
+            if len(block_token_ids) < self._block_size:
+                needed += 1
+                break
+
+            is_first_block = prev_block_hash is None
+            content_hash = PrefixCachingBlock.hash_block_tokens(
+                is_first_block=is_first_block,
+                prev_block_hash=prev_block_hash,
+                cur_block_token_ids=block_token_ids,
+                extra_hash=extra_hash,
+            )
+            cached_block_id = self._cached_blocks.get(content_hash)
+            if cached_block_id is None:
+                needed += 1
+            else:
+                tracker = self._block_tracker.get(cached_block_id)
+                if tracker is None or not tracker.active:
+                    needed += 1
+
+            prev_block_hash = content_hash
+
+        return needed
+
 
 class PrefixCachingBlock(Block):
     """A block implementation that supports prefix caching.
@@ -752,7 +805,7 @@ class PrefixCachingBlock(Block):
     # collisions. 'None' as a string will be hashed differently per process,
     # but consistently within the same process. This is the same as the
     # behavior of None prior to Python 3.12.
-    _none_hash: int = hash('None')
+    _none_hash: int = _NONE_HASH
 
     def __init__(
         self,
@@ -949,8 +1002,15 @@ class PrefixCachingBlock(Block):
         """
         if is_first_block and prev_block_hash is None:
             prev_block_hash = cls._none_hash
-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids,
-                     extra_hash))
+        digest = hashlib.sha256(
+            repr((
+                is_first_block,
+                prev_block_hash,
+                tuple(cur_block_token_ids),
+                extra_hash,
+            )).encode("utf-8")
+        ).digest()
+        return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
 class ComputedBlocksTracker:
@@ -974,7 +1034,7 @@ class ComputedBlocksTracker:
     # collisions. 'None' as a string will be hashed differently per process,
     # but consistently within the same process. This is the same as the
     # behavior of None prior to Python 3.12.
-    _none_hash: int = hash('None')
+    _none_hash: int = _NONE_HASH
 
     def __init__(
         self,
@@ -998,7 +1058,7 @@ class ComputedBlocksTracker:
         # We need this so that a sequence in continuous prefill doesn't
         # accidentally see its cached token count change. See comments in
         # `get_num_cached_tokens` for more details.
-        self._seq_id_to_num_tokens_computed: Dict[int, int] = {}
+        self._seq_id_to_num_tokens_computed: Dict[Tuple[int, Device], int] = {}
 
     def _update_seq_hashes(self, seq: Sequence) -> None:
         """Incrementally update the sequence's block hashes and record them."""
@@ -1046,7 +1106,9 @@ class ComputedBlocksTracker:
 
         self._seq_id_to_blocks_hashes[seq.seq_id] = block_hashes_recorded
 
-    def get_num_cached_tokens(self, seq: Sequence) -> int:
+    def get_num_cached_tokens(self,
+                              seq: Sequence,
+                              device: Device = Device.GPU) -> int:
         if not self._enable_caching:
             return 0
 
@@ -1056,8 +1118,9 @@ class ComputedBlocksTracker:
         # This routine should only update hash for any new blocks too.
         self._update_seq_hashes(seq)
 
+        cache_key = (seq.seq_id, device)
         num_computed_tokens_prev = self._seq_id_to_num_tokens_computed.get(
-            seq.seq_id, None)
+            cache_key, None)
 
         # TODO(rickyx): This hack could be removed once we mark blocks as
         # computed correctly with chunked prefills.
@@ -1074,20 +1137,35 @@ class ComputedBlocksTracker:
 
         # This is O(logN), where N is the number of blocks.
         num_cached_blocks = len(
-            self._allocator.find_cached_blocks_prefix(block_hashes))
+            self._allocator.find_cached_blocks_prefix(
+                block_hashes, device=device))
         num_cached_tokens = num_cached_blocks * self._block_size
-        self._seq_id_to_num_tokens_computed[seq.seq_id] = num_cached_tokens
+        self._seq_id_to_num_tokens_computed[cache_key] = num_cached_tokens
         return num_cached_tokens
+
+    def update_num_cached_tokens(self, seq: Sequence, num_cached_tokens: int,
+                                 device: Device = Device.GPU) -> None:
+        """Explicitly refresh the cached-token count for a sequence/device."""
+        if not self._enable_caching:
+            return
+        self._update_seq_hashes(seq)
+        self._seq_id_to_num_tokens_computed[(seq.seq_id,
+                                             device)] = num_cached_tokens
 
     def remove_seq(self, seq_id: int) -> None:
         """Stop tracking the sequence."""
         if not self._enable_caching:
             return
-        assert seq_id in self._seq_id_to_blocks_hashes
+        if seq_id not in self._seq_id_to_blocks_hashes:
+            return
         del self._seq_id_to_blocks_hashes[seq_id]
 
-        assert seq_id in self._seq_id_to_num_tokens_computed
-        del self._seq_id_to_num_tokens_computed[seq_id]
+        cache_keys = [
+            key for key in self._seq_id_to_num_tokens_computed
+            if key[0] == seq_id
+        ]
+        for key in cache_keys:
+            del self._seq_id_to_num_tokens_computed[key]
 
 
 class LastAccessBlocksTracker:

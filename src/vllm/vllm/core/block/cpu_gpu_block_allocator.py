@@ -301,6 +301,41 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         """
         return self._allocators[device].get_num_full_blocks_touched(blocks)
 
+    def get_num_new_blocks_needed(
+            self,
+            token_ids: List[int],
+            extra_hash: Optional[int],
+            num_lookahead_slots: int,
+            block_size: int,
+    ) -> int:
+        """Return the number of new GPU blocks an allocation will consume."""
+        gpu_allocator = self._allocators[Device.GPU]
+        total_blocks = -(-(len(token_ids) + num_lookahead_slots) // block_size)
+
+        if isinstance(gpu_allocator, PrefixCachingBlockAllocator):
+            base_blocks = gpu_allocator.count_new_blocks_for_token_ids(
+                token_ids, extra_hash=extra_hash)
+            token_blocks = -(-len(token_ids) // block_size)
+            return base_blocks + max(0, total_blocks - token_blocks)
+
+        return total_blocks
+
+    def is_block_active(self, block_id: int) -> bool:
+        allocator = self._block_ids_to_allocator.get(block_id)
+        if allocator is None:
+            return False
+        if isinstance(allocator, PrefixCachingBlockAllocator):
+            return allocator.is_block_active(block_id)
+        return True
+
+    def is_block_computed(self, block_id: int) -> bool:
+        allocator = self._block_ids_to_allocator.get(block_id)
+        if allocator is None:
+            return False
+        if isinstance(allocator, PrefixCachingBlockAllocator):
+            return allocator.block_is_computed(block_id)
+        return True
+
     def clear_copy_on_writes(self) -> List[Tuple[int, int]]:
         """Clears the copy-on-write (CoW) state and returns the mapping of
             source to destination block IDs.
@@ -315,10 +350,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
                                 now: float) -> None:
-        """Mark blocks as accessed, only use for prefix caching."""
-        # Prefix caching only supported on GPU.
-        device = Device.GPU
-        return self._allocators[device].mark_blocks_as_accessed(block_ids, now)
+        """Mark blocks as accessed on their owning device."""
+        for block_id in block_ids:
+            allocator = self._block_ids_to_allocator.get(block_id)
+            if allocator is not None:
+                allocator.mark_blocks_as_accessed([block_id], now)
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
         """Mark blocks as accessed, only use for prefix caching."""
@@ -369,6 +405,13 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         device: Device = Device.GPU,
     ) -> List[int]:
         return self._allocators[device].find_cached_blocks_prefix(block_hashes)
+
+    def get_cached_block_hashes(self, device: Device) -> List[int]:
+        """Return all content hashes tracked by the selected allocator."""
+        allocator = self._allocators[device]
+        if isinstance(allocator, PrefixCachingBlockAllocator):
+            return allocator.get_cached_block_hashes()
+        return []
 
 
 class NullBlock(Block):

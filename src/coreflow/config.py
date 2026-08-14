@@ -23,8 +23,8 @@ class PathConfig:
     data_dir: Path = field(default_factory=lambda: Path("data"))
 
     # Default node list / dependency paths (may be overridden per-workflow)
-    default_node_list: str = "data/React/node_list.json"
-    default_node_dependency: str = "data/React/node_dependency.json"
+    default_node_list: str = "data/node_list.json"
+    default_node_dependency: str = "data/node_dependency.json"
 
     # Profile output paths
     attn_profile: str = "Profiler/attn_profile.json"
@@ -48,6 +48,7 @@ class ModelConfig:
     num_heads: int = 32
     head_size: int = 128
     num_kv_heads: int = 8
+    intermediate_size: int = 14336
 
     @property
     def hidden_size(self) -> int:
@@ -193,8 +194,8 @@ def get_reflection_config() -> WorkflowConfig:
     """Configuration for the Reflection workflow (eigent dataset)."""
     return WorkflowConfig(
         workflow_name="reflection",
-        node_list_path="data/Reflection/node_list.json",
-        node_dependency_path="data/Reflection/node_dependency.json",
+        node_list_path="data/node_list.json",
+        node_dependency_path="data/node_dependency.json",
         agent=AgentConfig(
             agents=["Reflector", "System", "Search"],
             instance_cached_tokens=216_000,
