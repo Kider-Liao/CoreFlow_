@@ -160,89 +160,38 @@ class DAG:
 
         self.end_to_end_latency = None
     
-    def init_workflow_by_json(self, node_dependency: list, node_list: list):
-        self.workflow = self.parse_by_json(node_dependency, node_list)
+    def init_from_payload(self, node_dependency: dict, node_list: list) -> None:
+        """Build a DAG solely from the expanded /query payload."""
+        workflow = defaultdict(list)
 
-    def parse_by_json(self, node_dependency: dict, node_list: list):
-        workflow = defaultdict(lambda: [])  # (invocation_id, repeat) -> [] dependency list
-
-        def _count_tokens(value):
-            if isinstance(value, int):
-                return value
-            if isinstance(value, list):
-                if len(value) == 1 and isinstance(value[0], int):
-                    return value[0]
-                return len(value)
-            return 0
-
-        def _token_list(value):
-            if isinstance(value, list):
-                return value
-            if isinstance(value, int):
-                return [value]
-            return []
-
-        for record in node_dependency:
-            child_inv_id = int(record.split(':')[0])
-            child_repeat = int(record.split(':')[1])
-            if node_dependency[record] == []:
-                workflow[(child_inv_id, child_repeat)] = []
-            else:
-                for dep in node_dependency[record]:
-                    parent_inv_id = int(dep.split(':')[0])
-                    parent_repeat = int(dep.split(':')[1])
-                    workflow[(child_inv_id, child_repeat)].append((parent_inv_id, parent_repeat))
+        for child_id, parent_ids in node_dependency.items():
+            child_inv_id, child_repeat = map(int, child_id.split(":"))
+            child_key = (child_inv_id, child_repeat)
+            workflow[child_key] = [
+                tuple(map(int, parent_id.split(":")))
+                for parent_id in parent_ids
+            ]
 
         for record in node_list:
-            inv_id = int(record['node_id'].split(':')[0])
-            node_repeat = int(record['node_id'].split(':')[1])
-            agent_name = record['agent_name']
+            node_id = record["node_id"]
+            invocation_id, repeat = map(int, node_id.split(":"))
             node = Node(
-                agent_id=agent_name,
-                invocation_id=inv_id,
+                agent_id=record["agent_name"],
+                invocation_id=invocation_id,
                 status=NodeStatus.WAITING,
-                repeat=node_repeat,
-                input_tokens=_token_list(record.get("input_tokens", [])),
-                output_tokens=_token_list(record.get("output_tokens", [])),
+                repeat=repeat,
+                input_tokens=list(record["input_token_ids"]),
+                output_tokens=list(record["output_token_ids"]),
+                cached_tokens=int(record["cached_tokens"]),
+                num_input_tokens=int(record["num_input_tokens"]),
+                num_output_tokens=int(record["num_output_tokens"]),
+                keep_cache_in_gpu=bool(record["keep_cache_in_gpu"]),
+                free_cache=bool(record["free_cache"]),
             )
+            self.node_mapping[(invocation_id, repeat)] = node
 
-            node.assign_num_tokens(
-                input_tokens=_count_tokens(record.get("input_tokens", 0)),
-                output_tokens=_count_tokens(record.get("output_tokens", 0)),
-                cached_tokens=_count_tokens(record.get("cached_tokens", 0)),
-            )
-
-            self.node_mapping[(inv_id, node_repeat)] = node
-
-        for (inv_id, rpt) in self.node_mapping:
-            node = self.node_mapping[(inv_id, rpt)]
-            next_key = (inv_id, rpt + 1)
-            direct_repeat = (
-                next_key in self.node_mapping
-                and node_dependency.get(f"{inv_id}:{rpt+1}") == [f"{inv_id}:{rpt}"]
-            )
-            current_total_tokens = node.num_input_tokens + node.num_output_tokens
-            reusable = (
-                direct_repeat
-                and self.node_mapping[next_key].cached_tokens <= current_total_tokens
-            )
-
-            if reusable:
-                next_node = self.node_mapping[next_key]
-                node.has_next_repeat = True
-                node.keep_cache_in_gpu = True
-                node.free_cache = False
-                node.next_repeat_cached_tokens = next_node.cached_tokens
-                node.next_repeat_context = (
-                    next_node.cached_tokens + next_node.num_input_tokens
-                )
-            else:
-                node.has_next_repeat = False
-                node.keep_cache_in_gpu = False
-                node.free_cache = True
-
+        self.workflow = dict(workflow)
         self.node_count = len(self.node_mapping)
-        return workflow
             
     def update_result(
         self,
@@ -299,7 +248,7 @@ class DAG:
 
 def create_dag_by_json(work_dir, node_dependency: list, node_list: list)->DAG:
     dag = DAG(work_dir)
-    dag.init_workflow_by_json(node_dependency, node_list)
+    dag.init_from_payload(node_dependency, node_list)
     return dag
 
 

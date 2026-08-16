@@ -177,25 +177,30 @@ class UnifiedProfiler:
         interference_path: str,
         mlp_path: Optional[str] = None,
     ) -> None:
-        """Save all profiling results to JSON files."""
+        """Save each profiling result as soon as that stage completes."""
         if self._attn_data is None:
+            print("[profile] attention stage started")
             self._attn_data = self._attn.run()
+            Path(attn_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(attn_path, "w", encoding="utf-8") as f:
+                json.dump(self._attn_data, f)
+            print(f"[profile] attention stage saved to {attn_path}")
+
         if self._interference_data is None:
+            print("[profile] interference stage started")
             self._interference_data = self._interference.run()
+            Path(interference_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(interference_path, "w", encoding="utf-8") as f:
+                json.dump(self._interference_data, f)
+            print(f"[profile] interference stage saved to {interference_path}")
+
         if mlp_path is not None and self._mlp_data is None:
+            print("[profile] MLP stage started")
             self._mlp_data = self.profile_mlp()
-
-        for path in [attn_path, interference_path, mlp_path]:
-            if path is not None:
-                Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-        with open(attn_path, "w", encoding="utf-8") as f:
-            json.dump(self._attn_data, f)
-        with open(interference_path, "w", encoding="utf-8") as f:
-            json.dump(self._interference_data, f)
-        if mlp_path is not None:
+            Path(mlp_path).parent.mkdir(parents=True, exist_ok=True)
             with open(mlp_path, "w", encoding="utf-8") as f:
                 json.dump(self._mlp_data, f)
+            print(f"[profile] MLP stage saved to {mlp_path}")
 
     # ------------------------------------------------------------------
     # Verification
