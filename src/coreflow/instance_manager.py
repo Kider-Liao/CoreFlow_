@@ -4,7 +4,7 @@ Each vLLM instance registers itself with the controller on startup (POST /regist
 The InstanceManager tracks all active instances and their health status.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 
@@ -96,7 +96,9 @@ class InstanceManager:
         if context_range is not None:
             slot = self._get_or_create_slot(agent_id, context_range)
             key = (agent_id, slot)
-            self._context_instances.setdefault(key, []).append(instance_id)
+            context_ids = self._context_instances.setdefault(key, [])
+            if instance_id not in context_ids:
+                context_ids.append(instance_id)
 
         return info
 

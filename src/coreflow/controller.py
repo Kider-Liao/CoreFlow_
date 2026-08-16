@@ -13,7 +13,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import uvicorn
@@ -70,10 +70,10 @@ class AsyncController:
             return self._queries.get(query_id)
 
     def load_allocation(self, path: str) -> None:
-        """Pre-create schedulers and instance stubs from an allocation file.
+        """Pre-register instance stubs from an allocation file.
 
-        This mirrors the old synchronous controller behavior.  It is optional;
-        real instances overwrite the stubs when they register.
+        Schedulers are created lazily by ``get_scheduler()``.  Real instances
+        overwrite these stubs when they call ``/register``.
         """
         if not os.path.exists(path):
             logger.warning("Allocation file not found: %s", path)
@@ -155,17 +155,20 @@ class AsyncController:
 
     async def handle_node_complete(
         self,
+        instance_id: Optional[str],
         query_id: int,
         invocation_id: int,
         repeat: int,
         agent_id: str,
         free_cache: bool,
         keep_cache_in_gpu: bool,
+        input_token_ids: Optional[List[int]],
+        output_token_ids: Optional[List[int]],
+        num_input_tokens: Optional[int],
+        num_output_tokens: Optional[int],
         success: bool,
         error: Optional[str],
     ) -> None:
-        del keep_cache_in_gpu  # reserved for future migration policy
-
         state = await self.get_query(query_id)
         if state is None:
             raise HTTPException(status_code=404, detail="unknown query")
@@ -174,9 +177,18 @@ class AsyncController:
             state.error = error
             return
 
-        scheduler = await self.get_scheduler(agent_id)
-        if free_cache:
-            await scheduler.release(query_id, invocation_id)
+        if not free_cache:
+            scheduler = await self.get_scheduler(agent_id)
+            await scheduler.maybe_migrate_request(
+                source_instance_id=instance_id,
+                query_id=query_id,
+                invocation_id=invocation_id,
+                input_token_ids=input_token_ids or [],
+                output_token_ids=output_token_ids or [],
+                num_input_tokens=num_input_tokens,
+                num_output_tokens=num_output_tokens,
+                keep_cache_in_gpu=keep_cache_in_gpu,
+            )
 
         nodes = state.query.get_next_execute_agents(
             invocation_id=invocation_id,
@@ -233,6 +245,7 @@ class QueryRequest(BaseModel):
 
 
 class NodeCompleteRequest(BaseModel):
+    instance_id: Optional[str] = None
     query_id: int
     invocation_id: int
     repeat: int = 0
@@ -243,6 +256,8 @@ class NodeCompleteRequest(BaseModel):
     error: Optional[str] = None
     num_input_tokens: Optional[int] = None
     num_output_tokens: Optional[int] = None
+    input_token_ids: Optional[List[int]] = None
+    output_token_ids: Optional[List[int]] = None
 
 
 @app.post("/register")
@@ -279,12 +294,17 @@ async def create_query(req: QueryRequest):
 @app.post("/node_complete")
 async def node_complete(req: NodeCompleteRequest):
     await controller.handle_node_complete(
+        instance_id=req.instance_id,
         query_id=req.query_id,
         invocation_id=req.invocation_id,
         repeat=req.repeat,
         agent_id=req.agent_id,
         free_cache=req.free_cache,
         keep_cache_in_gpu=req.keep_cache_in_gpu,
+        input_token_ids=req.input_token_ids,
+        output_token_ids=req.output_token_ids,
+        num_input_tokens=req.num_input_tokens,
+        num_output_tokens=req.num_output_tokens,
         success=req.success,
         error=req.error,
     )

@@ -733,9 +733,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                            key=lambda x: not _block_is_cached(x))
         return block_hashes[:idx]
 
-    def get_cached_block_hashes(self) -> List[int]:
-        """Return all content hashes currently tracked by this allocator."""
-        return list(self._cached_blocks.keys())
+    def get_computed_cached_block_hashes(self) -> List[int]:
+        """Return content hashes that are currently usable/computed."""
+        return [
+            content_hash
+            for content_hash, block_id in self._cached_blocks.items()
+            if self.block_is_computed(block_id)
+        ]
 
     def count_new_blocks_for_token_ids(
             self,

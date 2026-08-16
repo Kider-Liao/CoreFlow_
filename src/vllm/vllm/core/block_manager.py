@@ -868,9 +868,46 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         return self._computed_blocks_tracker.get_num_cached_tokens(
             seq, device=device)
 
-    def get_cached_block_hashes(self, device: Device) -> List[int]:
-        """Return all content hashes tracked by the selected block allocator."""
-        return self.block_allocator.get_cached_block_hashes(device)
+    def get_computed_cached_block_hashes(self, device: Device) -> List[int]:
+        """Return computed content hashes tracked by the selected allocator."""
+        return self.block_allocator.get_computed_cached_block_hashes(device)
+
+    def register_migrated_cpu_cache(self, token_ids: List[int]) -> bool:
+        """Register only full blocks of a migrated request in CPU prefix cache."""
+        if not self.enable_caching or not token_ids:
+            return False
+
+        full_token_ids = token_ids[
+            :(len(token_ids) // self.block_size) * self.block_size
+        ]
+        if not full_token_ids:
+            return False
+
+        block_table = BlockTable(
+            block_size=self.block_size,
+            block_allocator=self.block_allocator,
+            max_block_sliding_window=self.max_block_sliding_window,
+        )
+        block_table.allocate(
+            token_ids=full_token_ids,
+            device=Device.CPU,
+            extra_hash=None,
+        )
+
+        full_block_ids = [
+            block.block_id for block in block_table.blocks
+            if block.is_full and block.block_id is not None
+        ]
+        if full_block_ids:
+            self.block_allocator.mark_blocks_as_computed_on_device(
+                full_block_ids, Device.CPU)
+            self.block_allocator.mark_blocks_as_accessed(
+                full_block_ids, time.time())
+
+        # Release the temporary references.  Content hashes remain in the CPU
+        # prefix-cache allocator and are computable from the evictor.
+        block_table.free()
+        return True
 
     def get_num_actually_cached_cpu_tokens(self, seq: Sequence) -> int:
         """Return the contiguous CPU prefix still owned by this sequence."""

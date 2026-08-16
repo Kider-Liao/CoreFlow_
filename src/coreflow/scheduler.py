@@ -1,11 +1,12 @@
 """Async per-agent scheduler.
 
-Routes a DAG node to the instance that is most likely to be able to reuse its
-KV cache.  The routing decision combines:
+Routing is stateless with respect to ``(query_id, invocation_id)``.  The
+scheduler refreshes every instance's cache state on each route and uses:
 
-1. Exact retained GPU entries, keyed by ``(query_id, invocation_id)``.
-2. Prefix-cache content hashes reported by each instance for both GPU and CPU.
-3. Context-range membership when hash-hit counts are tied.
+1. Exact retained GPU entry for the request key.
+2. The largest GPU+CPU prefix-cache hash hit count.
+3. Context-range membership plus ``active_requests + gpu_entries`` as a
+   tie-break.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -23,11 +24,7 @@ logger = logging.getLogger("async_scheduler")
 
 
 class AsyncAgentScheduler:
-    """Async scheduler for one agent.
-
-    Routing affinity is maintained for ``(query_id, invocation_id)`` so all
-    repeats of an invocation stay on the same instance.
-    """
+    """Async scheduler for one agent."""
 
     def __init__(
         self,
@@ -38,42 +35,10 @@ class AsyncAgentScheduler:
         self.agent_id = agent_id
         self._im = instance_manager
         self._http = http_client
-        self._routing: Dict[Tuple[int, int], str] = {}
-        self._load: Dict[str, Set[Tuple[int, int]]] = {}
-        self._routing_lock = asyncio.Lock()
-        self._load_lock = asyncio.Lock()
 
-    async def _add_load(
-        self, instance_id: str, query_id: int, invocation_id: int
-    ) -> None:
-        async with self._load_lock:
-            self._load.setdefault(instance_id, set()).add(
-                (query_id, invocation_id)
-            )
-
-    async def _remove_load(
-        self, instance_id: str, query_id: int, invocation_id: int
-    ) -> None:
-        async with self._load_lock:
-            keys = self._load.get(instance_id)
-            if keys:
-                keys.discard((query_id, invocation_id))
-
-    async def get_load(self, instance_id: str) -> int:
-        async with self._load_lock:
-            return len(self._load.get(instance_id, set()))
-
-    async def _commit_route(
-        self, key: Tuple[int, int], instance_id: str
-    ) -> str:
-        """Record the selected route, preserving concurrent-safety."""
-        async with self._routing_lock:
-            if key in self._routing:
-                return self._routing[key]
-            self._routing[key] = instance_id
-
-        await self._add_load(instance_id, key[0], key[1])
-        return instance_id
+        # Route always refreshes these values.  Migration may reuse them
+        # without an extra /cache_state round-trip.
+        self._instance_cache_states: Dict[str, Dict[str, Any]] = {}
 
     async def _fetch_cache_state(
         self, info: InstanceInfo
@@ -103,9 +68,9 @@ class AsyncAgentScheduler:
     @staticmethod
     def _compute_request_block_hashes(
         token_ids: List[int], block_size: int, none_hash: int
-    ) -> Set[int]:
-        """Compute vLLM-compatible block content hashes for the request."""
-        hashes: Set[int] = set()
+    ) -> List[int]:
+        """Compute ordered vLLM-compatible block hashes for the request."""
+        hashes: List[int] = []
         prev_block_hash = none_hash
 
         for start in range(0, len(token_ids), block_size):
@@ -126,38 +91,36 @@ class AsyncAgentScheduler:
                 byteorder="big",
                 signed=True,
             )
-            hashes.add(block_hash)
+            hashes.append(block_hash)
             prev_block_hash = block_hash
 
         return hashes
 
     @staticmethod
     def _count_hash_hits(
-        request_hashes: Set[int], state: Dict[str, Any]
+        request_hashes: List[int], state: Dict[str, Any]
     ) -> int:
         hash_blocks = state.get("hash_blocks") or {}
-        gpu_hashes = {int(hash_value) for hash_value in hash_blocks.get("gpu", [])}
-        cpu_hashes = {int(hash_value) for hash_value in hash_blocks.get("cpu", [])}
-        return len(request_hashes & (gpu_hashes | cpu_hashes))
+        gpu_hashes = {
+            int(hash_value) for hash_value in hash_blocks.get("gpu", [])
+        }
+        cpu_hashes = {
+            int(hash_value) for hash_value in hash_blocks.get("cpu", [])
+        }
+        cached_hashes = gpu_hashes | cpu_hashes
+        hits = 0
+        for block_hash in request_hashes:
+            if block_hash in cached_hashes:
+                hits += 1
+            else:
+                break
+        return hits
 
-    async def _route_by_load(
-        self,
-        key: Tuple[int, int],
-        num_input_tokens: int,
-    ) -> Optional[str]:
-        """Fallback used only when no cache state endpoint is available."""
-        slot = self._im.find_context_slot(self.agent_id, num_input_tokens)
-        if slot is None:
-            return None
-
-        candidates = self._im.get_instances_for_context(self.agent_id, slot)
-        if not candidates:
-            return None
-
-        loads = [(await self.get_load(info.instance_id), info)
-                 for info in candidates]
-        best = min(loads, key=lambda item: item[0])[1]
-        return await self._commit_route(key, best.instance_id)
+    @staticmethod
+    def _instance_score(state: Dict[str, Any]) -> int:
+        active_requests = int(state.get("active_requests") or 0)
+        gpu_entry_count = len(state.get("gpu_entries") or [])
+        return active_requests + gpu_entry_count
 
     async def route(
         self,
@@ -169,17 +132,11 @@ class AsyncAgentScheduler:
         """Select the best instance for a node.
 
         Decision order:
-        1. Existing ``(query_id, invocation_id)`` affinity.
-        2. Exact retained GPU entry matching the same key.
-        3. Most prefix-cache hash hits across all instances.
-        4. On hash-hit ties, least GPU entries among the matching context range.
+        1. Exact GPU entry for ``(query_id, invocation_id)``.
+        2. Largest prefix-cache hash hit count.
+        3. On hit ties, matching context range and smallest
+           ``active_requests + gpu_entries`` score.
         """
-        key = (query_id, invocation_id)
-
-        async with self._routing_lock:
-            if key in self._routing:
-                return self._routing[key]
-
         infos = self._im.get_instances_for_agent(self.agent_id)
         if not infos:
             return None
@@ -187,29 +144,45 @@ class AsyncAgentScheduler:
         results = await asyncio.gather(
             *(self._fetch_cache_state(info) for info in infos)
         )
+
+        for info, state in results:
+            if state is not None:
+                self._instance_cache_states[info.instance_id] = state
+
         cache_infos = [
             (info, state) for info, state in results if state is not None
         ]
         if not cache_infos:
-            return await self._route_by_load(key, num_input_tokens)
+            return None
 
-        # Exact retained GPU entry has the strongest affinity.
+        # Step 1: exact GPU entry is strongest.
+        exact_matches: List[Tuple[InstanceInfo, Dict[str, Any]]] = []
         for info, state in cache_infos:
             for entry in state.get("gpu_entries") or []:
                 if (
                     int(entry.get("query_id")) == query_id
                     and int(entry.get("invocation_id")) == invocation_id
                 ):
-                    return await self._commit_route(key, info.instance_id)
+                    exact_matches.append((info, state))
+                    break
 
+        if exact_matches:
+            best = min(
+                exact_matches,
+                key=lambda item: self._instance_score(item[1]),
+            )
+            return best[0].instance_id
+
+        # Step 2: compare prefix-cache hits across all instances.
         token_ids = self._normalize_token_ids(input_tokens)
+        scored: List[Tuple[int, InstanceInfo, Dict[str, Any]]] = []
 
-        scored = []
         for info, state in cache_infos:
             block_size = int(state.get("block_size") or 16)
             none_hash = state.get("none_hash")
             if none_hash is None:
                 continue
+
             request_hashes = self._compute_request_block_hashes(
                 token_ids, block_size, int(none_hash)
             )
@@ -217,37 +190,156 @@ class AsyncAgentScheduler:
             scored.append((hits, info, state))
 
         if not scored:
-            return await self._route_by_load(key, num_input_tokens)
+            return None
 
         max_hits = max(hits for hits, _, _ in scored)
-        tied = [(info, state) for hits, info, state in scored if hits == max_hits]
+        tied = [
+            (info, state)
+            for hits, info, state in scored
+            if hits == max_hits
+        ]
 
         if len(tied) == 1:
-            return await self._commit_route(key, tied[0][0].instance_id)
+            return tied[0][0].instance_id
 
-        # Tie-break: among instances serving the requested context range,
-        # prefer the instance with the fewest retained exact GPU entries.
-        slot = self._im.find_context_slot(self.agent_id, num_input_tokens)
-        if slot is None:
-            return None
-
-        context_ids = {
-            info.instance_id
-            for info in self._im.get_instances_for_context(self.agent_id, slot)
-        }
-        context_candidates = [
-            (info, state)
-            for info, state in cache_infos
-            if info.instance_id in context_ids
-        ]
-        if not context_candidates:
-            return None
-
-        best = min(
-            context_candidates,
-            key=lambda item: len(item[1].get("gpu_entries") or []),
+        # Step 3: hit-count tie.  Prefer instances in the matching context
+        # range with the smallest active/gpu-entry score.
+        slot = self._im.find_context_slot(
+            self.agent_id, num_input_tokens
         )
-        return await self._commit_route(key, best[0].instance_id)
+        if slot is not None:
+            context_ids = {
+                info.instance_id
+                for info in self._im.get_instances_for_context(
+                    self.agent_id, slot
+                )
+            }
+            context_candidates = [
+                (info, state)
+                for info, state in cache_infos
+                if info.instance_id in context_ids
+            ]
+            if context_candidates:
+                best = min(
+                    context_candidates,
+                    key=lambda item: self._instance_score(item[1]),
+                )
+                return best[0].instance_id
+
+        # No usable context range.  Fall back to the tied instances.
+        best = min(
+            tied,
+            key=lambda item: self._instance_score(item[1]),
+        )
+        return best[0].instance_id
+
+    async def maybe_migrate_request(
+        self,
+        source_instance_id: Optional[str],
+        query_id: int,
+        invocation_id: int,
+        input_token_ids: List[int],
+        output_token_ids: List[int],
+        keep_cache_in_gpu: bool,
+        num_input_tokens: Optional[int] = None,
+        num_output_tokens: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Migrate a completed request whose length outgrew its source range."""
+        if not source_instance_id:
+            return None
+
+        source_info = self._im.get(source_instance_id)
+        if source_info is None or source_info.context_range is None:
+            return None
+
+        if num_input_tokens is not None and num_output_tokens is not None:
+            total_length = int(num_input_tokens) + int(num_output_tokens)
+        else:
+            total_length = len(input_token_ids) + len(output_token_ids)
+        _, upper = source_info.context_range
+        if total_length < upper:
+            return None
+
+        target_slot = self._im.find_context_slot(
+            self.agent_id, total_length
+        )
+        if target_slot is None:
+            return None
+
+        candidates = [
+            info
+            for info in self._im.get_instances_for_context(
+                self.agent_id, target_slot
+            )
+            if info.instance_id != source_instance_id
+        ]
+        if not candidates:
+            return None
+
+        missing = [
+            info
+            for info in candidates
+            if info.instance_id not in self._instance_cache_states
+        ]
+        if missing:
+            results = await asyncio.gather(
+                *(self._fetch_cache_state(info) for info in missing)
+            )
+            for info, state in results:
+                if state is not None:
+                    self._instance_cache_states[info.instance_id] = state
+
+        available = [
+            info
+            for info in candidates
+            if self._instance_cache_states.get(info.instance_id) is not None
+        ]
+        if not available:
+            return None
+
+        target_info = min(
+            available,
+            key=lambda info: self._instance_score(
+                self._instance_cache_states[info.instance_id]
+            ),
+        )
+
+        payload = {
+            "query_id": query_id,
+            "invocation_id": invocation_id,
+            "request_id": (
+                f"q{query_id}_i{invocation_id}_r0_migrated"
+            ),
+            "input_tokens": input_token_ids,
+            "output_tokens": output_token_ids,
+            "keep_cache_in_gpu": keep_cache_in_gpu,
+        }
+
+        try:
+            response = await self._http.post(
+                f"{target_info.endpoint}/migrate_cache",
+                json=payload,
+            )
+            response.raise_for_status()
+            result = response.json()
+        except Exception as exc:
+            logger.warning(
+                "migrate_cache failed for %s: %s",
+                target_info.instance_id,
+                exc,
+            )
+            return None
+
+        if not result.get("success"):
+            return None
+
+        # The target's cache changed.  Drop it so the next route refreshes.
+        self._instance_cache_states.pop(target_info.instance_id, None)
+        return {
+            "source_instance_id": source_instance_id,
+            "target_instance_id": target_info.instance_id,
+            "device": result.get("device"),
+        }
 
     async def dispatch(
         self, instance_id: str, node_dict: dict
@@ -264,10 +356,3 @@ class AsyncAgentScheduler:
         except Exception as exc:
             logger.warning("dispatch failed for %s: %s", instance_id, exc)
             return None
-
-    async def release(self, query_id: int, invocation_id: int) -> None:
-        key = (query_id, invocation_id)
-        async with self._routing_lock:
-            instance_id = self._routing.pop(key, None)
-        if instance_id:
-            await self._remove_load(instance_id, query_id, invocation_id)

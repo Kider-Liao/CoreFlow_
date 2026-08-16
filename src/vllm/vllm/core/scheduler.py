@@ -1689,6 +1689,15 @@ class Scheduler:
             free_cache = self._should_free_cache(seq_group)
             keep_cache_in_gpu = self._should_keep_cache_in_gpu(seq_group)
 
+            # A request that grew beyond its instance's assigned context range
+            # cannot be retained as an exact GPU entry here.  Treat it as
+            # ``free_cache=True`` so the normal finished-request path releases
+            # the blocks instead of calling ``retain_blocks``.
+            if keep_cache_in_gpu and self._request_exceeds_context_range(
+                    seq_group):
+                free_cache = True
+                keep_cache_in_gpu = False
+
             if free_cache:
                 self.block_manager.free_request_cache(seq_group)
             elif keep_cache_in_gpu:
@@ -1745,6 +1754,24 @@ class Scheduler:
             return False
         return (self.block_manager.get_gpu_cached_entry(
             int(query_id), int(invocation_id)) is not None)
+
+    @staticmethod
+    def _request_total_length(seq_group: SequenceGroup) -> int:
+        return max(seq.get_len() for seq in seq_group.get_seqs())
+
+    @staticmethod
+    def _request_exceeds_context_range(seq_group: SequenceGroup) -> bool:
+        sp = seq_group.sampling_params
+        if sp is None or sp.extra_args is None:
+            return False
+        context_range = sp.extra_args.get("context_range")
+        if context_range is None:
+            return False
+        try:
+            upper = int(context_range[1])
+        except (TypeError, IndexError, ValueError):
+            return False
+        return Scheduler._request_total_length(seq_group) >= upper
 
     def free_finished_seq_groups(self) -> None:
         assert not any(sg.is_finished() for sg in self.waiting)

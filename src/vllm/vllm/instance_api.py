@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from typing import Any, List, Optional
 
 import httpx
@@ -14,10 +15,13 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from vllm import SamplingParams
+from vllm.core.interfaces import AllocStatus
 from vllm.core.block.prefix_caching_block import PrefixCachingBlock
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.inputs.data import token_inputs
 from vllm.sampling_params import RequestOutputKind
+from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
 
@@ -25,6 +29,8 @@ app = FastAPI()
 engine: Optional[AsyncLLMEngine] = None
 eos_token_id: Optional[int] = None
 controller_url: Optional[str] = None
+instance_id: Optional[str] = None
+instance_context_range: Optional[tuple[int, int]] = None
 
 
 def _forced_decoding_logits_processor(output_tokens: List[int]):
@@ -48,6 +54,55 @@ def _tokens_from_value(value: Any, token_id: int) -> list[int]:
     raise TypeError(f"Expected token list or token count, got {type(value).__name__}")
 
 
+def _register_migrated_gpu_cache(
+    async_engine: AsyncLLMEngine,
+    token_ids: List[int],
+    query_id: int,
+    invocation_id: int,
+    request_id: str,
+) -> bool:
+    """Register migrated tokens as a normal retained GPU cache entry.
+
+    The sequence group is intentionally not added to the scheduler.  It is
+    used only to allocate a normal block table and then go through
+    ``retain_blocks``, exactly like a finished ordinary request.
+    """
+    block_manager = async_engine.engine.scheduler[0].block_manager
+    seq_counter = async_engine.engine.seq_counter
+
+    inputs = token_inputs(prompt_token_ids=list(token_ids))
+    seq = Sequence(
+        seq_id=next(seq_counter),
+        inputs=inputs,
+        block_size=block_manager.block_size,
+    )
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        extra_args={
+            "query_id": query_id,
+            "invocation_id": invocation_id,
+            "keep_cache_in_gpu": True,
+            "free_cache": False,
+        },
+    )
+    seq_group = SequenceGroup(
+        request_id=request_id,
+        seqs=[seq],
+        arrival_time=time.time(),
+        sampling_params=sampling_params,
+    )
+
+    if block_manager.can_allocate(seq_group) != AllocStatus.OK:
+        return False
+
+    block_manager.allocate(seq_group)
+    seq.status = SequenceStatus.FINISHED_STOPPED
+    block_manager.retain_blocks(seq_group)
+    return True
+
+
 class GenerateRequest(BaseModel):
     query_id: Optional[int] = None
     invocation_id: Optional[int] = None
@@ -62,9 +117,18 @@ class GenerateRequest(BaseModel):
     num_output_tokens: Optional[int] = None
 
 
+class MigrateCacheRequest(BaseModel):
+    query_id: int
+    invocation_id: int
+    request_id: str
+    input_tokens: List[int]
+    output_tokens: List[int]
+    keep_cache_in_gpu: bool = False
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest):
-    global engine, eos_token_id, controller_url
+    global engine, eos_token_id, controller_url, instance_id, instance_context_range
     if engine is None:
         return {"success": False, "error": "engine not initialized"}
 
@@ -95,6 +159,7 @@ async def generate(req: GenerateRequest):
             "requested_input_tokens": len(input_tokens),
             "keep_cache_in_gpu": req.keep_cache_in_gpu,
             "free_cache": req.free_cache,
+            "context_range": instance_context_range,
             "eos_token_id": eos_token_id if eos_token_id is not None else -1,
         },
     )
@@ -140,6 +205,7 @@ async def generate(req: GenerateRequest):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 await client.post(f"{controller_url}/node_complete", json={
+                    "instance_id": instance_id,
                     "query_id": req.query_id,
                     "invocation_id": req.invocation_id,
                     "repeat": req.repeat,
@@ -148,6 +214,8 @@ async def generate(req: GenerateRequest):
                     "free_cache": req.free_cache,
                     "num_input_tokens": req.num_input_tokens or len(input_tokens),
                     "num_output_tokens": req.num_output_tokens or len(output_tokens),
+                    "input_token_ids": input_tokens,
+                    "output_token_ids": generated,
                     "success": token_match,
                     "error": error,
                 })
@@ -186,15 +254,45 @@ async def cache_state():
     return {
         "block_size": block_manager.block_size,
         "none_hash": PrefixCachingBlock._none_hash,
+        "active_requests": scheduler.get_num_unfinished_seq_groups(),
         "gpu_entries": [
             {"query_id": query_id, "invocation_id": invocation_id}
             for query_id, invocation_id
             in block_manager.get_gpu_cached_entry_keys()
         ],
         "hash_blocks": {
-            "gpu": block_manager.get_cached_block_hashes(Device.GPU),
-            "cpu": block_manager.get_cached_block_hashes(Device.CPU),
+            "gpu": block_manager.get_computed_cached_block_hashes(Device.GPU),
+            "cpu": block_manager.get_computed_cached_block_hashes(Device.CPU),
         },
+    }
+
+
+@app.post("/migrate_cache")
+async def migrate_cache(req: MigrateCacheRequest):
+    global engine
+    if engine is None:
+        return {"success": False, "error": "engine not initialized"}
+
+    token_ids = list(req.input_tokens) + list(req.output_tokens)
+    if not token_ids:
+        return {"success": False, "error": "empty token_ids"}
+
+    if req.keep_cache_in_gpu:
+        registered = _register_migrated_gpu_cache(
+            async_engine=engine,
+            token_ids=token_ids,
+            query_id=req.query_id,
+            invocation_id=req.invocation_id,
+            request_id=req.request_id,
+        )
+        if registered:
+            return {"success": True, "device": "gpu"}
+
+    block_manager = engine.engine.scheduler[0].block_manager
+    registered = block_manager.register_migrated_cpu_cache(token_ids)
+    return {
+        "success": registered,
+        "device": "cpu" if registered else None,
     }
 
 
@@ -204,11 +302,15 @@ def run_instance_server(
     async_engine: AsyncLLMEngine,
     tokenizer_eos: Optional[int],
     controller: Optional[str],
+    instance_id_value: Optional[str],
+    context_range: Optional[tuple[int, int]],
 ) -> None:
-    global engine, eos_token_id, controller_url
+    global engine, eos_token_id, controller_url, instance_id, instance_context_range
     engine = async_engine
     eos_token_id = tokenizer_eos
     controller_url = controller
+    instance_id = instance_id_value
+    instance_context_range = context_range
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
@@ -294,6 +396,8 @@ def main() -> None:
         async_engine=async_engine,
         tokenizer_eos=tokenizer_eos,
         controller=args.controller_url,
+        instance_id_value=args.instance_id,
+        context_range=(args.context_lower, args.context_upper),
     )
 
 

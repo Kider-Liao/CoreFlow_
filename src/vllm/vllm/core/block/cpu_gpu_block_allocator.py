@@ -362,6 +362,14 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         device = Device.GPU
         return self._allocators[device].mark_blocks_as_computed(block_ids)
 
+    def mark_blocks_as_computed_on_device(
+        self, block_ids: List[int], device: Device
+    ) -> None:
+        """Mark blocks as computed on an explicit device."""
+        allocator = self._allocators[device]
+        if hasattr(allocator, "mark_blocks_as_computed"):
+            allocator.mark_blocks_as_computed(block_ids)
+
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:
         # Prefix caching only supported on GPU.
@@ -406,11 +414,11 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
     ) -> List[int]:
         return self._allocators[device].find_cached_blocks_prefix(block_hashes)
 
-    def get_cached_block_hashes(self, device: Device) -> List[int]:
-        """Return all content hashes tracked by the selected allocator."""
+    def get_computed_cached_block_hashes(self, device: Device) -> List[int]:
+        """Return computed content hashes tracked by the selected allocator."""
         allocator = self._allocators[device]
         if isinstance(allocator, PrefixCachingBlockAllocator):
-            return allocator.get_cached_block_hashes()
+            return allocator.get_computed_cached_block_hashes()
         return []
 
 
